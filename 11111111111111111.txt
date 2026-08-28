@@ -1,5 +1,5 @@
-[Usermode] - [ProcessDumper.cpp:823] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
-[Usermode] - [ProcessDumper.cpp:823] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
+[Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
+[Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
 [Usermode] - [ProcessDumper.cpp:531] [GObjects] DumpBuffer synced: writable data pages forced-read
 [Usermode] - [ProcessDumper.cpp:548] [GObjects] GetDataRegions: 4 writable section(s) found, scanning for FUObjectArray structure
 [Usermode] - [ProcessDumper.cpp:654] [GObjects] DEBUG anchor N=65793 Chunks=6 @ 0x7FF7B40ED268 but no chunk-table ptr; [-24..+24] qwords: 0000000000000000 0000000000000000 0000000000000000 0000020000010101 0000000800000006 000080000000000A 0000000000000009
@@ -62,10 +62,10 @@
 [Usermode] - [ProcessDumper.cpp:654] [GObjects] DEBUG anchor N=65601 Chunks=5 @ 0x7FF7B40EFAC8 but no chunk-table ptr; [-24..+24] qwords: 000100010000001F 0000000000000005 000000000000000B 0000000000010041 00007FF7B3E33478 0000000000000000 0000000000000008
 [Usermode] - [ProcessDumper.cpp:654] [GObjects] DEBUG anchor N=65554 Chunks=10 @ 0x7FF7B40F1800 but no chunk-table ptr; [-24..+24] qwords: 0000000000000000 00007FF7A06BAF00 00007FF7A06A8A80 0020000000010012 00007FF7A06A8D40 001800000000000A 00000018FFFFFFFF
 [Usermode] - [ProcessDumper.cpp:654] [GObjects] DEBUG anchor N=65552 Chunks=8 @ 0x7FF7B40F1B68 but no chunk-table ptr; [-24..+24] qwords: 0000000000000000 00007FF7A06BAF00 00007FF7A06A3710 0020000000010010 00007FF7A06A3920 0018000000000008 00000018FFFFFFFF
-[Usermode] - [ProcessDumper.cpp:702] [GObjects] MATCH @ 0x7FF7B40F1D70 (Objects=0x7FF7B40F1CE8): N=131072 Chunks=2 | Cap=0x20000 base+0x0C=0 base+0x10=-1603620384 | N@0x7FF7B40F1D80 qword=0x00007FF7A06AB1E0
+[Usermode] - [ProcessDumper.cpp:684] [GObjects] MATCH @ 0x7FF7B40F1D70 (Objects=0x7FF7B40F1CE8): N=65538 (from chunks) Chunks=2 | qword@base=0x00007FF7B40F1CE8
   [+] GObjects (GUObjectArray): ImageBase + 0x16CF1D70
   [+] GObjects (GUObjectArray): 0x7FF7B40F1D70 (absolute)
-  [>] TUObjectArray: Objects[chunks]=0x7FF7B40F1CE8 N=131072 Max=0 Chunks=2/0
+  [>] TUObjectArray: Objects[chunks]=0x7FF7B40F1CE8 N=65538 Max=0 Chunks=2/0
   [+] Live UObjects: 0
 
-  [Monitor] [████████░░░░░░░░░░░░░░░░░░░░░░]  29.23%  (34608 / 118384 pages)
+  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.73%  (29279 / 118384 pages)
