@@ -1,3 +1,4 @@
+  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.64%  (29171 / 118384 pages)
 [Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
 [Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
 [Usermode] - [ProcessDumper.cpp:531] [GObjects] DumpBuffer synced: writable data pages forced-read
@@ -68,4 +69,4 @@
   [>] TUObjectArray: Objects[chunks]=0x7FF7B40F1CE8 N=65538 Max=0 Chunks=2/0
   [+] Live UObjects: 0
 
-  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.73%  (29279 / 118384 pages)
+  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.83%  (29394 / 118384 pages)
