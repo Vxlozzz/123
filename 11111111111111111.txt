@@ -1,6 +1,40 @@
-  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.64%  (29171 / 118384 pages)
-[Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
-[Usermode] - [ProcessDumper.cpp:805] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Polymorphysic Memory Dumper                                     │
+  │ Unreal Engine 5 - Memory Dump                                   │
+  │ Operating through Kernel Driver                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  [*] Usage: ProcessDumper.exe <process.exe> [-t threshold]
+
+
+  Enter process name: FortniteClient-Win64-Shipping.exe
+
+  [*] Configuration
+  [>] Target      : FortniteClient-Win64-Shipping.exe
+  [>] Threshold   : 100%
+
+  [>] Attaching to process...
+[Usermode] - [ProcessDumper.cpp:22] Attached to FortniteClient-Win64-Shipping.exe (PID: 15776)
+[Usermode] - [ProcessDumper.cpp:41] Image: 0x7FF79D400000 | Size: 0x1CE6F4E8 (473533 KB)
+[Usermode] - [ProcessDumper.cpp:927] Loaded on-disk PE fallback: C:\Program Files\Epic Games\Fortnite\FortniteGame\Binaries\Win64\FortniteClient-Win64-Shipping.exe (484908704 bytes)
+[Usermode] - [ProcessDumper.cpp:950] Initial read: 118384 / 118383 pages
+[Usermode] - [PageMonitor.cpp:28] Initialized monitor: 0x7FF79D400000 | 118384 pages
+[Usermode] - [ProcessDumper.cpp:68] Monitor started - scanning pages via driver
+
+  [*] Monitoring page decryptions...
+
+  [>] Hotkeys:
+  [>] [F7] Stop & dump current state
+  [>] [1] Find UWorld offset
+  [>] [2] Find gameviewport offset
+  [>] [3] Find gameinstance offset
+  [>] [4] Find StaticFindObject offset
+  [>] [5] Find GObjects / TUObjectArray
+
+  [Monitor] [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   7.16%  (8474 / 118384 pages)
+[Usermode] - [ProcessDumper.cpp:814] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
+[Usermode] - [ProcessDumper.cpp:814] [GObjects] FillDataSections: forced-read 18775 page(s) of writable data sections
 [Usermode] - [ProcessDumper.cpp:531] [GObjects] DumpBuffer synced: writable data pages forced-read
 [Usermode] - [ProcessDumper.cpp:548] [GObjects] GetDataRegions: 4 writable section(s) found, scanning for FUObjectArray structure
 [Usermode] - [ProcessDumper.cpp:654] [GObjects] DEBUG anchor N=65793 Chunks=6 @ 0x7FF7B40ED268 but no chunk-table ptr; [-24..+24] qwords: 0000000000000000 0000000000000000 0000000000000000 0000020000010101 0000000800000006 000080000000000A 0000000000000009
@@ -69,4 +103,4 @@
   [>] TUObjectArray: Objects[chunks]=0x7FF7B40F1CE8 N=65538 Max=0 Chunks=2/0
   [+] Live UObjects: 0
 
-  [Monitor] [███████░░░░░░░░░░░░░░░░░░░░░░░]  24.83%  (29394 / 118384 pages)
+  [Monitor] [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   9.92%  (11749 / 118384 pages)
