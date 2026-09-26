@@ -269,12 +269,151 @@ We try multiple instruction sizes (5, 6, 7 bytes) since the exact
 instruction length affects the RIP-relative calculation.
 */
 
-std::vector<XRefLocation> FindAllXRefsToRVA(
-    uint8_t* CodeSection,
-    size_t   CodeSize,
-    uint32_t CodeSectionRVA,
-    uint32_t TargetRVA
+
+GlobalOffset FindGlobalNearXRef(
+    PEImage&      Image,
+    XRefLocation& StringXRef,
+    uint32_t      CodeSectionRVA,
+    const char*   MarkerName
 )
+{
+    GlobalOffset result;
+    result.Marker = MarkerName;
+
+    if (!Image.TextSection || !StringXRef.Found)
+        return result;
+
+    uint8_t* code = Image.TextSection->Data;
+    size_t codeSize = Image.TextSection->Size;
+
+    size_t xrefPos = StringXRef.FileOffset;
+    constexpr int32_t scanRange = 0x20;
+
+    // Scan backward then forward
+    for (int direction = -1; direction <= 1; direction += 2)
+    {
+        for (int32_t offset = 7; offset <= scanRange; offset++)
+        {
+            size_t scanPos;
+            if (direction == -1)
+                scanPos = xrefPos - offset;
+            else
+                scanPos = xrefPos + offset;
+
+            if (scanPos < 4 || scanPos >= codeSize - 4)
+                continue;
+
+            // Skip if this is the string xref itself
+            if (scanPos == xrefPos)
+                continue;
+
+            // Read potential displacement at this position
+            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
+
+            // Try instruction sizes 5-7
+            for (uint8_t instSize = 5; instSize <= 7; instSize++)
+            {
+                // Calculate instruction's starting address
+                // Displacement is at position scanPos within the instruction
+                // instStart = scanPos - (instSize - 4)
+                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
+
+                if (instStart < 0)
+                    continue;
+
+                // Calculate instruction RVA from code section base
+                uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
+
+                // Calculate target address using RIP-relative formula:
+                // Target = InstructionEnd + Displacement
+                // Target = (instRVA + instSize) + disp
+                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
+
+                // Verify this isn't pointing to our string (different xref)
+                if (potentialTarget != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize +
+                    *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
+                {
+                    result.GlobalRVA = static_cast<uint32_t>(potentialTarget);
+                    result.Displacement = disp;
+                    result.Found = true;
+                    return result;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+{
+    GlobalOffset result;
+    result.Marker = MarkerName;
+    
+    if (!Image.TextSection || !StringXRef.Found)
+        return result;
+    
+    uint8_t* code = Image.TextSection->Data;
+    size_t codeSize = Image.TextSection->Size;
+    
+    size_t xrefPos = StringXRef.FileOffset;
+    constexpr int32_t scanRange = 0x20;
+    
+    // Scan backward then forward
+    for (int direction = -1; direction <= 1; direction += 2)
+    {
+        for (int32_t offset = 7; offset <= scanRange; offset++)
+        {
+            size_t scanPos;
+            if (direction == -1)
+                scanPos = xrefPos - offset;
+            else
+                scanPos = xrefPos + offset;
+            
+            if (scanPos < 4 || scanPos >= codeSize - 4)
+                continue;
+            
+            // Skip if this is the string xref itself
+            if (scanPos == xrefPos)
+                continue;
+            
+            // Read potential displacement at this position
+            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
+            
+            // Try instruction sizes 5-7
+            for (uint8_t instSize = 5; instSize <= 7; instSize++)
+            {
+                // Calculate instruction's starting address
+                // Displacement is at position scanPos within the instruction
+                // instStart = scanPos - (instSize - 4)
+                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
+                
+                if (instStart < 0)
+                    continue;
+                
+                // Calculate instruction RVA from code section base
+                uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
+                
+                // Calculate target address using RIP-relative formula:
+                // Target = InstructionEnd + Displacement
+                // Target = (instRVA + instSize) + disp
+                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
+                
+                // Verify this isn't pointing to our string (different xref)
+                if (potentialTarget != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize + 
+                    *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
+                {
+                    result.GlobalRVA = static_cast<uint32_t>(potentialTarget);
+                    result.Displacement = disp;
+                    result.Found = true;
+                    return result;
+                }
+            }
+        }
+    }
+    
+    return result;
+}
+
 {
     std::vector<XRefLocation> results;
 
