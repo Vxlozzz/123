@@ -1,934 +1,3 @@
-#pragma once
-#include <cstdint>
-#include <string>
-#include <windows.h>
-
-// ============================================================================
-// CONFIGURATION - Plug your IDA offsets here
-// ============================================================================
-namespace Offsets
-{
-    constexpr uintptr_t FNamePoolOffset   = 0x0; // <- Set in IDA
-    constexpr uintptr_t GUObjectArrayOffset = 0x0; // <- Set in IDA
-}
-
-// ============================================================================
-// FNAMEPOOL STRUCTURES - UE5/6 Chunked String Storage
-// ============================================================================
-
-/*
-FNamePool layout (UE5+):
-- Strings are stored in chunks for cache efficiency
-- Each chunk is 64KB, entries are variable length
-- Name index is split into [chunk index][entry offset within chunk]
-- Chunk index: bits 0-15 (max 65536 chunks, ~4GB total string data)
-- Entry offset: derived from index & 0xFFFF + chunk base pointer
-*/
-
-struct FNameEntry
-{
-    // Header: lower 4 bits hold info flags (wide, length, etc)
-    // Upper bits store hash and length
-    uint32_t Header;
-    
-    // Variable-length string data follows immediately after header
-    union
-    {
-        char    AnsiName[1];
-        wchar_t WideName[1];
-    };
-
-    // Check if this entry uses wide characters
-    inline bool IsWide() const
-    {
-        return (Header & 0x1) != 0;
-    }
-
-    // Extract string length from header (upper bits)
-    // UE6 layout: [hash bits][length bits:10][flags:6]
-    inline int32_t GetLength() const
-    {
-        return (Header >> 6) & 0x3FF; // 10 bits for length (max 1023 chars)
-    }
-
-    // Retrieve the actual string (converts wide to ansi if needed)
-    std::string GetString() const;
-};
-
-// Chunk allocator for FNamePool entries
-// Each chunk holds variable-length FNameEntry structures
-struct FNamePoolChunk
-{
-    uint8_t* Data; // Pointer to chunk memory block
-};
-
-// Main FNamePool structure - handles string storage and lookup
-struct FNamePool
-{
-    // Critical section for thread safety
-    CRITICAL_SECTION CriticalSection;
-    
-    // Current chunk being written to
-    int32_t CurrentChunk;
-    
-    // Byte offset within current chunk for next allocation
-    int32_t CurrentByte;
-    
-    // Array of chunk pointers (each 64KB block)
-    // Max 0x10000 chunks (index mask 0xFFFF)
-    FNamePoolChunk Chunks[0x10000];
-
-    // Resolve an FName index to its string
-    // Index format: [chunk_index:16][entry_offset_in_chunk:remaining bits]
-    std::string ResolveName(uint32_t NameIndex) const;
-};
-
-// ============================================================================
-// GUOBJECTARRAY STRUCTURES - Global UObject Storage
-// ============================================================================
-
-/*
-FUObjectItem layout:
-- Wraps UObject pointer with additional tracking data
-- Flags: ownership, garbage collection, async load state
-- UObject pointer is first member for easy casting
-*/
-
-struct FUObjectItem
-{
-    class UObject* Object;         // Pointer to the actual UObject
-    int32_t        Flags;          // Object flags (owned, garbage, etc)
-    int32_t        ClusterIndex;   // For garbage collection clustering
-    int32_t        SerialNumber;   // Unique serial for tracking
-};
-
-/*
-TUObjectArray layout (UE5+):
-- Objects stored in multiple chunks for memory efficiency
-- Similar to FNamePool but for UObject pointers
-- Each element is an FUObjectItem (16 bytes typically)
-*/
-
-struct TUObjectArray
-{
-    /*
-    UE5/6 TUObjectArray Layout:
-    - Objects: Array of chunk pointers (FUObjectItem**)
-    - Each chunk is exactly 64KB (0x10000 bytes)
-    - Elements per chunk = 0x10000 / sizeof(FUObjectItem)
-    - With 24-byte FUObjectItem: 2730 items per chunk
-    - With 16-byte FUObjectItem: 4096 items per chunk
-    
-    Chunk calculation:
-    - ChunkIndex = Index / ElementsPerChunk
-    - OffsetInChunk = Index % ElementsPerChunk
-    */
-    
-    FUObjectItem** Objects;        // Array of chunk pointers
-    int32_t        MaxElements;    // Total allocated capacity
-    int32_t        NumElements;    // Current object count
-    int32_t        MaxChunks;      // Maximum chunks allocated
-    int32_t        NumChunks;      // Current chunk count
-    
-    // Size of each chunk in bytes (always 0x10000 = 65536)
-    static constexpr int32_t ChunkSize = 0x10000;
-    
-    // Elements per chunk (calculated at runtime based on FUObjectItem size)
-    static constexpr int32_t ElementsPerChunk = ChunkSize / sizeof(FUObjectItem);
-
-    // Access object by index with chunk calculation
-    FUObjectItem* GetObjectByIndex(int32_t Index) const;
-    
-    // Iterate all active UObjects
-    void ForEachObject(void(*Callback)(UObject*, void*), void* UserData) const;
-    
-    // Get total chunk count
-    int32_t GetNumChunks() const { return NumChunks; }
-    
-    // Get chunk pointer by index
-    FUObjectItem* GetChunk(int32_t ChunkIndex) const;
-};
-
-// Base UObject class (minimal definition for iteration purposes)
-class UObject
-{
-public:
-    void*        VTable;           // Virtual function table
-    int32_t      Index;            // Index into GUObjectArray
-    class UClass* Class;           // Object's class type
-    FName        Name;             // Object name (index into FNamePool)
-    int32_t      OuterIndex;       // Outer object (owner)
-
-    // Get object name as string
-    std::string GetName() const;
-    
-    // Get class name as string
-    std::string GetClassName() const;
-};
-
-// FName structure - lightweight name reference
-struct FName
-{
-    uint32_t Index;                // Index into FNamePool
-    uint32_t Number;               // Instance number (for duplicates)
-
-    std::string ToString() const;
-};
-
-// ============================================================================
-// GLOBAL ACCESSORS
-// ============================================================================
-
-inline FNamePool* GetFNamePool()
-{
-    return reinterpret_cast<FNamePool*>(
-        (uintptr_t)GetModuleHandle(nullptr) + Offsets::FNamePoolOffset
-    );
-}
-
-inline TUObjectArray* GetGUObjectArray()
-{
-    return reinterpret_cast<TUObjectArray*>(
-        (uintptr_t)GetModuleHandle(nullptr) + Offsets::GUObjectArrayOffset
-    );
-}
-
-#include "UE_SDK_Core.h"
-
-// ============================================================================
-// FNAMEPOOL IMPLEMENTATION
-// ============================================================================
-
-/*
-UE6 Chunk math explanation:
-- FName index is a 32-bit value
-- Bits [0:15]  = entry offset (shifted left by 2 for 4-byte alignment)
-- Bits [16:31] = chunk index (which 64KB block)
-- Each chunk is 64KB = 0x10000 bytes
-- Entry offset must be multiplied by 4 (sizeof pointer alignment)
-
-Example: NameIndex = 0xABCD0002
-- Chunk index = 0xABCD (upper 16 bits, >> 16)
-- Entry offset = 0x0002 * 4 = 8 bytes from chunk start
-- Final address = Chunks[0xABCD]->Data + 8
-*/
-
-std::string FNameEntry::GetString() const
-{
-    std::string result;
-    int32_t length = GetLength();
-    
-    if (length <= 0)
-        return result;
-    
-    result.reserve(length);
-    
-    if (IsWide())
-    {
-        // Convert wide to ANSI (narrow conversion)
-        for (int32_t i = 0; i < length && WideName[i] != 0; i++)
-        {
-            result += static_cast<char>(WideName[i]);
-        }
-    }
-    else
-    {
-        // Direct copy from ANSI buffer
-        result.assign(AnsiName, length);
-    }
-    
-    return result;
-}
-
-std::string FNamePool::ResolveName(uint32_t NameIndex) const
-{
-    // UE6: Extract chunk index from upper 16 bits
-    uint32_t chunkIndex = NameIndex >> 16;
-    
-    // UE6: Extract entry offset from lower 16 bits, multiply by 4 for alignment
-    uint32_t entryOffset = (NameIndex & 0xFFFF) * 4;
-    
-    // Bounds check
-    if (chunkIndex >= 0x10000)
-        return "";
-    
-    // Get chunk base pointer
-    const FNamePoolChunk& chunk = Chunks[chunkIndex];
-    if (!chunk.Data)
-        return "";
-    
-    // Calculate entry pointer
-    const FNameEntry* entry = reinterpret_cast<const FNameEntry*>(
-        chunk.Data + entryOffset
-    );
-    
-    return entry->GetString();
-}
-
-// ============================================================================
-// GUOBJECTARRAY IMPLEMENTATION
-// ============================================================================
-
-/*
-TUObjectArray chunk-based access (UE5/6):
-
-Chunk Layout:
-- Each chunk is exactly 65,536 bytes (0x10000)
-- Elements per chunk = 0x10000 / sizeof(FUObjectItem)
-- For 16-byte items: 4096 elements per chunk
-- For 24-byte items: 2730 elements per chunk
-- For 32-byte items: 2048 elements per chunk
-
-Address Calculation:
-- ChunkIndex = Index / ElementsPerChunk
-- OffsetInChunk = Index % ElementsPerChunk
-- Address = Objects[ChunkIndex][OffsetInChunk]
-*/
-
-FUObjectItem* TUObjectArray::GetChunk(int32_t ChunkIndex) const
-{
-    if (!Objects || ChunkIndex < 0 || ChunkIndex >= NumChunks)
-        return nullptr;
-    
-    return Objects[ChunkIndex];
-}
-
-FUObjectItem* TUObjectArray::GetObjectByIndex(int32_t Index) const
-{
-    // Bounds check
-    if (Index < 0 || Index >= NumElements)
-        return nullptr;
-    
-    if (!Objects)
-        return nullptr;
-    
-    // Calculate which chunk contains this index
-    int32_t chunkIndex = Index / ElementsPerChunk;
-    int32_t offsetInChunk = Index % ElementsPerChunk;
-    
-    // Verify chunk exists
-    if (chunkIndex >= NumChunks)
-        return nullptr;
-    
-    // Get the chunk pointer
-    FUObjectItem* chunk = Objects[chunkIndex];
-    if (!chunk)
-        return nullptr;
-    
-    // Return pointer to the specific item within the chunk
-    return &chunk[offsetInChunk];
-}
-
-void TUObjectArray::ForEachObject(
-    void(*Callback)(UObject*, void*),
-    void* UserData
-) const
-{
-    if (!Callback || !Objects || NumElements <= 0)
-        return;
-    
-    // Iterate all registered objects
-    for (int32_t i = 0; i < NumElements; i++)
-    {
-        FUObjectItem* item = GetObjectByIndex(i);
-        
-        // Skip invalid slots (freed or null objects)
-        if (!item || !item->Object)
-            continue;
-        
-        // Invoke callback with object and user data
-        Callback(item->Object, UserData);
-    }
-}
-
-// Alternative: Chunk-by-chunk iteration (more efficient for large arrays)
-void TUObjectArray::ForEachObjectByChunk(
-    void(*Callback)(UObject*, void*),
-    void* UserData
-) const
-{
-    if (!Callback || !Objects || NumElements <= 0)
-        return;
-    
-    int32_t processedCount = 0;
-    
-    for (int32_t chunkIdx = 0; chunkIdx < NumChunks && processedCount < NumElements; chunkIdx++)
-    {
-        FUObjectItem* chunk = Objects[chunkIdx];
-        if (!chunk)
-            continue;
-        
-        // Iterate through elements in this chunk
-        int32_t startIdx = chunkIdx * ElementsPerChunk;
-        int32_t endIdx = (chunkIdx + 1) * ElementsPerChunk;
-        
-        // Clamp to actual element count
-        if (endIdx > NumElements)
-            endIdx = NumElements;
-        
-        for (int32_t i = startIdx; i < endIdx; i++)
-        {
-            int32_t offsetInChunk = i % ElementsPerChunk;
-            FUObjectItem* item = &chunk[offsetInChunk];
-            
-            if (item && item->Object)
-            {
-                Callback(item->Object, UserData);
-                processedCount++;
-            }
-        }
-    }
-}
-
-// ============================================================================
-// UOBJECT HELPERS
-// ============================================================================
-
-std::string FName::ToString() const
-{
-    FNamePool* pool = GetFNamePool();
-    if (!pool)
-        return "";
-    
-    std::string baseName = pool->ResolveName(Index);
-    
-    // Append instance number if > 0 (for duplicate names like "Widget_2")
-    if (Number > 0)
-    {
-        baseName += "_" + std::to_string(Number);
-    }
-    
-    return baseName;
-}
-
-std::string UObject::GetName() const
-{
-    return Name.ToString();
-}
-
-std::string UObject::GetClassName() const
-{
-    if (!Class)
-        return "None";
-    
-    return Class->Name.ToString();
-}
-
-// ============================================================================
-// EXAMPLE USAGE / DUMPING
-// ============================================================================
-
-#include <iostream>
-#include <fstream>
-
-void DumpAllUObjects()
-{
-    TUObjectArray* objArray = GetGUObjectArray();
-    if (!objArray)
-    {
-        std::cerr << "[!] GUObjectArray not found" << std::endl;
-        return;
-    }
-    
-    std::cout << "[*] Total objects: " << objArray->NumElements << std::endl;
-    
-    int32_t count = 0;
-    for (int32_t i = 0; i < objArray->NumElements; i++)
-    {
-        FUObjectItem* item = objArray->GetObjectByIndex(i);
-        if (!item || !item->Object)
-            continue;
-        
-        UObject* obj = item->Object;
-        std::string name = obj->GetName();
-        std::string className = obj->GetClassName();
-        
-        std::cout << "[" << i << "] " << className << " " << name << std::endl;
-        count++;
-    }
-    
-    std::cout << "[*] Dumped " << count << " active objects" << std::endl;
-}
-
-// Entry point for testing
-int main()
-{
-    std::cout << "UE5/6 SDK Dumper - Core Structures" << std::endl;
-    std::cout << "==================================" << std::endl;
-    std::cout << "FNamePool offset: 0x" << std::hex << Offsets::FNamePoolOffset << std::endl;
-    std::cout << "GUObjectArray offset: 0x" << std::hex << Offsets::GUObjectArrayOffset << std::endl;
-    std::cout << std::endl;
-    
-    DumpAllUObjects();
-    
-    std::cin.get();
-    return 0;
-}
-
-#pragma once
-#include <cstdint>
-#include <string>
-#include <vector>
-#include <windows.h>
-#include <psapi.h>
-
-// ============================================================================
-// SIGNATURE DEFINITIONS - UE5/6 FNamePool & GUObjectArray
-// ============================================================================
-
-namespace Signatures
-{
-    /*
-    FNamePool Signature (UE5.1+ / UE6):
-    
-    Target: String reference "%d ansi FNames" used in FNamePool initialization
-    Context: FNamePool::DumpStats() or constructor loads this string address
-        
-    Pattern: lea rcx, [rip + offset_to_string]
-             call printf
-    
-    The LEA instruction loads the string address relative to RIP.
-    We find the LEA, extract the relative offset, and resolve the string address.
-    Then FNamePool is typically a few instructions before this (static global).
-    
-    Alternative pattern targets FNamePool directly via its chunk initialization.
-    */
-    constexpr const char* FNamePool = 
-        "74 09 48 8D 15 ? ? ? ? ";  // LEA RDX, [rip + offset] before string ref
-    
-    // Extended pattern for FNamePool static address
-    // Targets: Initialize function that sets up FNamePool chunks
-    constexpr const char* FNamePoolAlt = 
-        "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ? ";  // LEA RCX, [FNamePool]
-    
-    /*
-    GUObjectArray Signature (UE5.1+ / UE6):
-    
-    Target: FUObjectArray::AllocateObjectPool() function
-    Context: Allocates the chunk array and stores pointer to GUObjectArray global
-    
-    Pattern: lea rcx, [GUObjectArray]  ; load global address
-             call allocation_function
-    
-    The LEA instruction's RIP-relative offset points to GUObjectArray global.
-    */
-    constexpr const char* GUObjectArray = 
-        "48 8B 05 ? ? ? ? 48 85 C0 75 ? ";  // MOV RAX, [GUObjectArray]
-    
-    // Alternative: Direct LEA to GUObjectArray
-    constexpr const char* GUObjectArrayAlt = 
-        "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D";
-    
-    /*
-    GNames (older UE4/early UE5 compatibility - FNamePool predecessor):
-    
-    For backwards compatibility, some UE5 builds still reference GNames.
-    */
-    constexpr const char* GNames = 
-        "48 89 05 ? ? ? ? 48 89 0D";
-}
-
-// ============================================================================
-// PATTERN SCANNER
-// ============================================================================
-
-namespace PatternScanner
-{
-    struct PatternByte
-    {
-        uint8_t Value;
-        bool    IsWildcard;
-    };
-
-    // Convert signature string "48 8D ? ? 5A" to pattern bytes
-    inline std::vector<PatternByte> ParsePattern(const char* Pattern)
-    {
-        std::vector<PatternByte> result;
-        std::string patternStr(Pattern);
-        
-        size_t pos = 0;
-        while (pos < patternStr.length())
-        {
-            // Skip whitespace
-            while (pos < patternStr.length() && patternStr[pos] == ' ')
-                pos++;
-            
-            if (pos >= patternStr.length())
-                break;
-            
-            PatternByte byte = { 0, false };
-            
-            // Check for wildcard
-            if (patternStr[pos] == '?')
-            {
-                byte.IsWildcard = true;
-                byte.Value = 0;
-                pos++;
-            }
-            else
-            {
-                // Parse hex byte
-                char hex[3] = { patternStr[pos], patternStr[pos + 1], 0 };
-                byte.Value = static_cast<uint8_t>(std::stoi(hex, nullptr, 16));
-                byte.IsWildcard = false;
-                pos += 2;
-            }
-            
-            result.push_back(byte);
-        }
-        
-        return result;
-    }
-
-    /*
-    FindPattern: Scans memory buffer for signature match
-    
-    Parameters:
-        StartAddress  - Base address to begin scan
-        Size          - Size of memory region to scan
-        Pattern       - Signature string with '?' wildcards (e.g., "48 8D 0D ? ? ? ?")
-    
-    Returns:
-        Address of first match, or nullptr if not found
-    */
-    inline uint8_t* FindPattern(
-        uint8_t*    StartAddress,
-        size_t      Size,
-        const char* Pattern
-    )
-    {
-        std::vector<PatternByte> pattern = ParsePattern(Pattern);
-        
-        if (pattern.empty())
-            return nullptr;
-        
-        size_t patternLength = pattern.size();
-        
-        // Scan through memory
-        for (size_t i = 0; i <= Size - patternLength; i++)
-        {
-            bool found = true;
-            
-            for (size_t j = 0; j < patternLength; j++)
-            {
-                if (!pattern[j].IsWildcard && 
-                    StartAddress[i + j] != pattern[j].Value)
-                {
-                    found = false;
-                    break;
-                }
-            }
-            
-            if (found)
-                return &StartAddress[i];
-        }
-        
-        return nullptr;
-    }
-
-    /*
-    FindPatternEx: Scans module memory for signature
-    
-    Parameters:
-        ModuleBase    - Base address of module (e.g., GetModuleHandle)
-        ModuleSize    - Size of module (optional, auto-detect if 0)
-        Pattern       - Signature string with '?' wildcards
-    
-    Returns:
-        Address of first match, or nullptr if not found
-    */
-    inline uint8_t* FindPatternEx(
-        HMODULE     ModuleBase,
-        const char* Pattern,
-        size_t      ModuleSize = 0
-    )
-    {
-        uint8_t* base = reinterpret_cast<uint8_t*>(ModuleBase);
-        size_t size = ModuleSize;
-        
-        // Auto-detect module size if not provided
-        if (size == 0)
-        {
-            MODULEINFO modInfo;
-            if (!GetModuleInformation(GetCurrentProcess(), ModuleBase, &modInfo, sizeof(modInfo)))
-                return nullptr;
-            size = modInfo.SizeOfImage;
-        }
-        
-        return FindPattern(base, size, Pattern);
-    }
-
-    /*
-    ResolveRelativeAddress: Extracts address from RIP-relative instruction
-    
-    Parameters:
-        Address      - Address of instruction containing relative offset
-        Offset       - Offset from instruction start to the relative displacement
-        InstructionSize - Total size of the instruction (default 7 for LEA/MOV)
-    
-    Returns:
-        Absolute address pointed to by the instruction
-    
-    Example:
-        Address points to "48 8D 0D [XX XX XX XX]"
-        Offset = 3 (position of displacement)
-        InstructionSize = 7
-        Returns: Address + 7 + displacement
-    */
-    inline uint8_t* ResolveRelativeAddress(
-        uint8_t* Address,
-        int32_t  Offset,
-        int32_t  InstructionSize = 7
-    )
-    {
-        // Read the 32-bit relative displacement
-        int32_t relativeOffset = *reinterpret_cast<int32_t*>(Address + Offset);
-        
-        // RIP points to next instruction, so: next_instruction + displacement
-        return Address + InstructionSize + relativeOffset;
-    }
-}
-
-// ============================================================================
-// SCANNER USAGE EXAMPLE
-// ============================================================================
-
-/*
-Example: Finding FNamePool and GUObjectArray in FortniteClient
-
-// 1. Find FNamePool
-uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(
-    GetModuleHandle(nullptr),
-    Signatures::FNamePoolAlt
-);
-
-if (fnPoolPattern)
-{
-    // Pattern: 48 8D 0D [XX XX XX XX] E8 ...
-    // Offset 3 contains the relative displacement to FNamePool
-    FNamePool* fnPool = reinterpret_cast<FNamePool*>(
-        PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7)
-    );
-}
-
-// 2. Find GUObjectArray
-uint8_t* objArrayPattern = PatternScanner::FindPatternEx(
-    GetModuleHandle(nullptr),
-    Signatures::GUObjectArray
-);
-
-if (objArrayPattern)
-{
-    // Pattern: 48 8B 05 [XX XX XX XX] 48 85 C0 ...
-    // Offset 3 contains the relative displacement to GUObjectArray
-    TUObjectArray* objArray = reinterpret_cast<TUObjectArray*>(
-        PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7)
-    );
-}
-*/
-
-#include "PatternScanner.h"
-#include <iostream>
-
-// ============================================================================
-// SIGNATURE SCANNER - INTEGRATION EXAMPLE
-// ============================================================================
-
-/*
-Signature Pattern Explanations:
-
-1. FNamePool Signatures
-   
-   Primary: "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ?"
-   - Target: FNamePool initialization code
-   - Instruction: LEA RCX, [rip + offset_to_FNamePool]
-   - The LEA loads the address of the global FNamePool static variable
-   - We extract the RIP-relative offset at position 3
-   
-   Alternative: "74 09 48 8D 15 ? ? ? ?"
-   - Target: String reference "%d ansi FNames"
-   - Instruction: LEA RDX, [rip + offset_to_string]
-   - Found near FNamePool::DumpStats()
-   - Used when FNamePool global pattern fails
-   
-   String Reference Context:
-   - "%d ansi FNames" is a debug string in FNamePool initialization
-   - FNamePool constructor or DumpStats() loads this for logging
-   - Finding this string means FNamePool is nearby in code
-   - From the string reference, scan backwards for FNamePool global access
-
-2. GUObjectArray Signatures
-   
-   Primary: "48 8B 05 ? ? ? ? 48 85 C0 75 ?"
-   - Target: FUObjectArray::AllocateObjectPool() or GUObjectArray access
-   - Instruction: MOV RAX, [rip + offset_to_GUObjectArray]
-   - Loads the global UObject array pointer
-   - The test and jnz follow: "48 85 C0" (TEST RAX, RAX), "75 ?" (JNZ)
-   - Offset 3 contains the relative displacement
-   
-   Alternative: "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D"
-   - Target: GUObjectArray initialization
-   - Instruction: LEA RCX, [rip + offset_to_GUObjectArray]
-   - Found in object array setup code
-   - Followed by call (E8) and compare (83 3D)
-
-3. Pattern Scanning Methodology
-   
-   RIP-Relative Addressing:
-   - x64 instructions reference globals via RIP-relative offsets
-   - Format: [instruction opcode] [32-bit signed displacement]
-   - Absolute address = instruction_address + instruction_size + displacement
-   - This allows ASLR-safe code (offsets stay constant regardless of base)
-   
-   Wildcards ('?'):
-   - Match any byte value
-   - Used for addresses that change per-build
-   - Also for offsets that vary between compiler runs
-   
-   Instruction Sizes:
-   - LEA reg, [rip + offset] = 7 bytes (48 8D 0D XX XX XX XX)
-   - MOV reg, [rip + offset] = 7 bytes (48 8B 05 XX XX XX XX)
-   - Always verify instruction size when resolving addresses
-
-4. Fortnite-Specific Notes
-   
-   Shipping Build Optimizations:
-   - Functions may be inlined, changing expected patterns
-   - Keep multiple signature variants for fallback
-   - Always verify found address points to valid memory
-   
-   Anti-Cheat Considerations:
-   - External scanner should read process memory remotely
-   - Don't write to game memory during scanning
-   - Pattern scan at startup before anti-cheat fully initializes
-*/
-
-// ============================================================================
-// HELPER: AUTO-OFFSET FINDER
-// ============================================================================
-
-struct FoundOffsets
-{
-    uintptr_t FNamePool;
-    uintptr_t GUObjectArray;
-    bool      Success;
-};
-
-inline FoundOffsets FindUE6Offsets()
-{
-    FoundOffsets result = { 0, 0, false };
-    
-    HMODULE hModule = GetModuleHandle(nullptr);
-    if (!hModule)
-    {
-        std::cerr << "[!] Failed to get module handle" << std::endl;
-        return result;
-    }
-    
-    // Get module base and size
-    MODULEINFO modInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo)))
-    {
-        std::cerr << "[!] Failed to get module info" << std::endl;
-        return result;
-    }
-    
-    uint8_t* moduleBase = reinterpret_cast<uint8_t*>(hModule);
-    size_t moduleSize = modInfo.SizeOfImage;
-    
-    std::cout << "[*] Module base: 0x" << std::hex << (uintptr_t)moduleBase << std::endl;
-    std::cout << "[*] Module size: 0x" << std::hex << moduleSize << std::endl;
-    
-    // Find FNamePool
-    std::cout << "\n[*] Scanning for FNamePool..." << std::endl;
-    
-    uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePoolAlt, moduleSize);
-    
-    if (!fnPoolPattern)
-    {
-        std::cout << "[!] Primary FNamePool pattern failed, trying alternate..." << std::endl;
-        fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePool, moduleSize);
-    }
-    
-    if (fnPoolPattern)
-    {
-        // Resolve RIP-relative address
-        // Pattern: 48 8D 0D [XX XX XX XX] ...
-        // Offset 3 = position of 32-bit displacement
-        uint8_t* fnPoolAddress = PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7);
-        
-        result.FNamePool = reinterpret_cast<uintptr_t>(fnPoolAddress) - reinterpret_cast<uintptr_t>(moduleBase);
-        
-        std::cout << "[+] FNamePool found at offset: 0x" << std::hex << result.FNamePool << std::endl;
-        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)fnPoolPattern << std::endl;
-        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)fnPoolAddress << std::endl;
-    }
-    else
-    {
-        std::cerr << "[-] FNamePool signature not found" << std::endl;
-    }
-    
-    // Find GUObjectArray
-    std::cout << "\n[*] Scanning for GUObjectArray..." << std::endl;
-    
-    uint8_t* objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArray, moduleSize);
-    
-    if (!objArrayPattern)
-    {
-        std::cout << "[!] Primary GUObjectArray pattern failed, trying alternate..." << std::endl;
-        objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArrayAlt, moduleSize);
-    }
-    
-    if (objArrayPattern)
-    {
-        // Resolve RIP-relative address
-        // Pattern: 48 8B 05 [XX XX XX XX] ...
-        // Offset 3 = position of 32-bit displacement
-        uint8_t* objArrayAddress = PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7);
-        
-        result.GUObjectArray = reinterpret_cast<uintptr_t>(objArrayAddress) - reinterpret_cast<uintptr_t>(moduleBase);
-        
-        std::cout << "[+] GUObjectArray found at offset: 0x" << std::hex << result.GUObjectArray << std::endl;
-        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)objArrayPattern << std::endl;
-        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)objArrayAddress << std::endl;
-    }
-    else
-    {
-        std::cerr << "[-] GUObjectArray signature not found" << std::endl;
-    }
-    
-    result.Success = (result.FNamePool != 0 && result.GUObjectArray != 0);
-    
-    if (result.Success)
-    {
-        std::cout << "\n[+] All offsets found successfully!" << std::endl;
-        std::cout << "\n// Paste into Offsets namespace:" << std::endl;
-        std::cout << "constexpr uintptr_t FNamePoolOffset   = 0x" << std::hex << result.FNamePool << ";" << std::endl;
-        std::cout << "constexpr uintptr_t GUObjectArrayOffset = 0x" << std::hex << result.GUObjectArray << ";" << std::endl;
-    }
-    
-    return result;
-}
-
-// ============================================================================
-// ENTRY POINT FOR TESTING
-// ============================================================================
-
-int main()
-{
-    std::cout << "========================================" << std::endl;
-    std::cout << "UE6 Pattern Scanner - Offset Finder" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << std::endl;
-    
-    FoundOffsets offsets = FindUE6Offsets();
-    
-    std::cout << "\nPress Enter to exit..." << std::endl;
-    std::cin.get();
-    
-    return offsets.Success ? 0 : 1;
-}
-
 #include <cstdint>
 #include <iostream>
 #include <fstream>
@@ -936,13 +5,12 @@ int main()
 #include <string>
 
 // ============================================================================
-// STRING-REFERENCE SIGNATURE SCANNER
+// STRING-REFERENCE SIGNATURE SCANNER - SINGLE FILE BUILD
 // ============================================================================
 
 namespace TargetStrings
 {
     // FNamePool string references (stable across UE versions)
-    // These strings are hardcoded in FNamePool initialization and debug code
     constexpr const char* FNamePoolMarkers[] = {
         "%d ansi FNames",      // FNamePool::DumpStats output
         "bIsPureAnsi",         // FNameEntry property check
@@ -953,7 +21,6 @@ namespace TargetStrings
     };
     
     // GUObjectArray string references (stable across UE versions)
-    // These strings appear in object array management and GC code
     constexpr const char* GUObjectArrayMarkers[] = {
         "gc.MaxObjects",                    // GC config variable near GUObjectArray init
         "LoadTimeFileForCommandlet",        // Object loading code
@@ -965,7 +32,7 @@ namespace TargetStrings
 }
 
 // ============================================================================
-// PE PARSER HELPERS - EXTRACT SECTIONS FROM LOADED BINARY
+// PE PARSER - MINIMAL HEADERS
 // ============================================================================
 
 struct PESection
@@ -973,149 +40,98 @@ struct PESection
     std::string Name;
     uint8_t*    Data;
     size_t      Size;
-    uint32_t    VirtualAddress;     // RVA in loaded image
-    uint32_t    RawOffset;          // File offset
-    uint32_t    Characteristics;    // Section flags
+    uint32_t    VirtualAddress;
+    uint32_t    RawOffset;
+    uint32_t    Characteristics;
 };
 
 struct PEImage
 {
-    uint8_t*              Base;
-    size_t                Size;
-    uint32_t              ImageBase;         // Preferred load address
+    uint8_t*               Base;
+    size_t                 Size;
+    uint32_t               ImageBase;
     std::vector<PESection> Sections;
-    
-    PESection* TextSection;   // .text (executable code)
-    PESection* DataSection;   // .data (initialized data)
-    PESection* RDataSection;  // .rdata (read-only data, strings live here)
+    PESection*             TextSection;
+    PESection*             DataSection;
+    PESection*             RDataSection;
 };
 
-// Minimal PE header definitions
 #pragma pack(push, 1)
 struct DOSHeader
 {
     uint16_t e_magic;
-    uint16_t e_cblp;
-    uint16_t e_cp;
-    uint16_t e_crlc;
-    uint16_t e_cparhdr;
-    uint16_t e_minalloc;
-    uint16_t e_maxalloc;
-    uint16_t e_ss;
-    uint16_t e_sp;
-    uint16_t e_csum;
-    uint16_t e_ip;
-    uint16_t e_cs;
-    uint16_t e_lfarlc;
-    uint16_t e_ovno;
-    uint16_t e_res[4];
-    uint16_t e_oemid;
-    uint16_t e_oeminfo;
-    uint16_t e_res2[10];
+    uint16_t e_cblp, e_cp, e_crlc, e_cparhdr, e_minalloc, e_maxalloc;
+    uint16_t e_ss, e_sp, e_csum, e_ip, e_cs, e_lfarlc, e_ovno;
+    uint16_t e_res[4], e_oemid, e_oeminfo, e_res2[10];
     int32_t  e_lfanew;
 };
 
 struct FileHeader
 {
-    uint16_t Machine;
-    uint16_t NumberOfSections;
-    uint32_t TimeDateStamp;
-    uint32_t PointerToSymbolTable;
-    uint32_t NumberOfSymbols;
-    uint16_t SizeOfOptionalHeader;
-    uint16_t Characteristics;
+    uint16_t Machine, NumberOfSections;
+    uint32_t TimeDateStamp, PointerToSymbolTable, NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader, Characteristics;
 };
 
 struct OptionalHeader64
 {
     uint16_t Magic;
-    uint8_t  MajorLinkerVersion;
-    uint8_t  MinorLinkerVersion;
-    uint32_t SizeOfCode;
-    uint32_t SizeOfInitializedData;
-    uint32_t SizeOfUninitializedData;
-    uint32_t AddressOfEntryPoint;
-    uint32_t BaseOfCode;
+    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
+    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint, BaseOfCode;
     uint64_t ImageBase;
-    uint32_t SectionAlignment;
-    uint32_t FileAlignment;
-    uint16_t MajorOperatingSystemVersion;
-    uint16_t MinorOperatingSystemVersion;
-    uint16_t MajorImageVersion;
-    uint16_t MinorImageVersion;
-    uint16_t MajorSubsystemVersion;
-    uint16_t MinorSubsystemVersion;
-    uint32_t Win32VersionValue;
-    uint32_t SizeOfImage;
-    uint32_t SizeOfHeaders;
-    uint32_t CheckSum;
-    uint16_t Subsystem;
-    uint16_t DllCharacteristics;
-    uint64_t SizeOfStackReserve;
-    uint64_t SizeOfStackCommit;
-    uint64_t SizeOfHeapReserve;
-    uint64_t SizeOfHeapCommit;
-    uint32_t LoaderFlags;
-    uint32_t NumberOfRvaAndSizes;
+    uint32_t SectionAlignment, FileAlignment;
+    uint16_t MajorOperatingSystemVersion, MinorOperatingSystemVersion;
+    uint16_t MajorImageVersion, MinorImageVersion;
+    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
+    uint32_t Win32VersionValue, SizeOfImage, SizeOfHeaders, CheckSum;
+    uint16_t Subsystem, DllCharacteristics;
+    uint64_t SizeOfStackReserve, SizeOfStackCommit, SizeOfHeapReserve, SizeOfHeapCommit;
+    uint32_t LoaderFlags, NumberOfRvaAndSizes;
 };
 
 struct SectionHeader
 {
     char     Name[8];
-    uint32_t VirtualSize;
-    uint32_t VirtualAddress;
-    uint32_t SizeOfRawData;
-    uint32_t PointerToRawData;
-    uint32_t PointerToRelocations;
-    uint32_t PointerToLinenumbers;
-    uint16_t NumberOfRelocations;
-    uint16_t NumberOfLinenumbers;
+    uint32_t VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData;
+    uint32_t PointerToRelocations, PointerToLinenumbers;
+    uint16_t NumberOfRelocations, NumberOfLinenumbers;
     uint32_t Characteristics;
 };
 #pragma pack(pop)
 
-// Parse PE sections from loaded binary buffer
 bool ParsePEImage(uint8_t* Buffer, size_t BufferSize, PEImage& Image)
 {
     if (BufferSize < sizeof(DOSHeader))
         return false;
     
-    DOSHeader* dosHeader = reinterpret_cast<DOSHeader*>(Buffer);
-    
-    // Verify DOS signature "MZ"
-    if (dosHeader->e_magic != 0x5A4D)
+    DOSHeader* dos = reinterpret_cast<DOSHeader*>(Buffer);
+    if (dos->e_magic != 0x5A4D)
         return false;
     
-    int32_t peOffset = dosHeader->e_lfanew;
-    
+    int32_t peOffset = dos->e_lfanew;
     if (peOffset < 0 || peOffset + 4 + sizeof(FileHeader) > BufferSize)
         return false;
     
-    // Verify PE signature "PE\0\0"
-    uint32_t* peSignature = reinterpret_cast<uint32_t*>(Buffer + peOffset);
-    if (*peSignature != 0x00004550)
+    uint32_t* peSig = reinterpret_cast<uint32_t*>(Buffer + peOffset);
+    if (*peSig != 0x00004550)
         return false;
     
-    FileHeader* fileHeader = reinterpret_cast<FileHeader*>(Buffer + peOffset + 4);
-    OptionalHeader64* optionalHeader = reinterpret_cast<OptionalHeader64*>(
-        Buffer + peOffset + 4 + sizeof(FileHeader)
-    );
+    FileHeader* file = reinterpret_cast<FileHeader*>(Buffer + peOffset + 4);
+    OptionalHeader64* opt = reinterpret_cast<OptionalHeader64*>(
+        Buffer + peOffset + 4 + sizeof(FileHeader));
     
-    // Verify PE64
-    if (optionalHeader->Magic != 0x20b)
+    if (opt->Magic != 0x20b)
         return false;
     
-    Image.ImageBase = static_cast<uint32_t>(optionalHeader->ImageBase);
+    Image.ImageBase = static_cast<uint32_t>(opt->ImageBase);
     
-    SectionHeader* sectionHeaders = reinterpret_cast<SectionHeader*>(
-        Buffer + peOffset + 4 + sizeof(FileHeader) + fileHeader->SizeOfOptionalHeader
-    );
+    SectionHeader* sections = reinterpret_cast<SectionHeader*>(
+        Buffer + peOffset + 4 + sizeof(FileHeader) + file->SizeOfOptionalHeader);
     
-    // Parse each section
-    for (uint16_t i = 0; i < fileHeader->NumberOfSections; i++)
+    for (uint16_t i = 0; i < file->NumberOfSections; i++)
     {
-        SectionHeader* sh = &sectionHeaders[i];
-        
+        SectionHeader* sh = &sections[i];
         PESection section;
         section.Name = std::string(sh->Name, strnlen(sh->Name, 8));
         section.VirtualAddress = sh->VirtualAddress;
@@ -1123,10 +139,8 @@ bool ParsePEImage(uint8_t* Buffer, size_t BufferSize, PEImage& Image)
         section.Size = sh->SizeOfRawData;
         section.Characteristics = sh->Characteristics;
         section.Data = Buffer + sh->PointerToRawData;
-        
         Image.Sections.push_back(section);
         
-        // Identify key sections
         if (section.Name == ".text")
             Image.TextSection = &Image.Sections.back();
         else if (section.Name == ".data")
@@ -1139,13 +153,13 @@ bool ParsePEImage(uint8_t* Buffer, size_t BufferSize, PEImage& Image)
 }
 
 // ============================================================================
-// STRING FINDER - LOCATE STRING IN PE SECTION
+// STRING LOCATOR
 // ============================================================================
 
 struct StringLocation
 {
-    uint32_t FileOffset;    // Offset in file
-    uint32_t RVA;           // Relative Virtual Address (for RIP-relative calc)
+    uint32_t FileOffset;
+    uint32_t RVA;
     bool     Found;
     
     StringLocation() : FileOffset(0), RVA(0), Found(false) {}
@@ -1159,16 +173,15 @@ StringLocation FindStringInSection(
 )
 {
     StringLocation result;
-    size_t targetLen = strlen(TargetString);
+    size_t len = strlen(TargetString);
     
-    if (targetLen == 0 || !SectionData)
+    if (len == 0 || !SectionData)
         return result;
     
-    // Scan section for string bytes
-    for (size_t i = 0; i <= SectionSize - targetLen; i++)
+    for (size_t i = 0; i <= SectionSize - len; i++)
     {
         bool match = true;
-        for (size_t j = 0; j < targetLen; j++)
+        for (size_t j = 0; j < len; j++)
         {
             if (SectionData[i + j] != static_cast<uint8_t>(TargetString[j]))
             {
@@ -1179,18 +192,6 @@ StringLocation FindStringInSection(
         
         if (match)
         {
-            // Verify null terminator or non-string char after
-            // (prevents partial matches)
-            if (i + targetLen < SectionSize)
-            {
-                uint8_t nextChar = SectionData[i + targetLen];
-                // Accept null terminator, newline, or any non-alpha char
-                if (nextChar != 0 && nextChar != '\n' && nextChar != '\r')
-                {
-                    // Could still be valid, string might be part of larger format
-                }
-            }
-            
             result.FileOffset = static_cast<uint32_t>(i);
             result.RVA = SectionRVA + static_cast<uint32_t>(i);
             result.Found = true;
@@ -1201,82 +202,71 @@ StringLocation FindStringInSection(
     return result;
 }
 
-StringLocation FindStringInImage(
-    PEImage&    Image,
-    const char* TargetString
-)
+StringLocation FindStringInImage(PEImage& Image, const char* TargetString)
 {
     StringLocation result;
     
-    // Strings typically in .rdata (read-only data)
+    // Check .rdata first (strings typically here)
     if (Image.RDataSection)
     {
         result = FindStringInSection(
             Image.RDataSection->Data,
             Image.RDataSection->Size,
             Image.RDataSection->VirtualAddress,
-            TargetString
-        );
+            TargetString);
         if (result.Found)
             return result;
     }
     
-    // Fallback: check .data section
+    // Fallback to .data
     if (Image.DataSection)
     {
         result = FindStringInSection(
             Image.DataSection->Data,
             Image.DataSection->Size,
             Image.DataSection->VirtualAddress,
-            TargetString
-        );
+            TargetString);
         if (result.Found)
             return result;
     }
     
-    // Last resort: scan entire binary
-    result = FindStringInSection(
-        Image.Base,
-        Image.Size,
-        0,
-        TargetString
-    );
-    
+    // Last resort: entire binary
+    result = FindStringInSection(Image.Base, Image.Size, 0, TargetString);
     return result;
 }
 
 // ============================================================================
-// XREF FINDER - REGISTER-AGNOSTIC STRING REFERENCE LOCATOR
+// REGISTER-INDEPENDENT XREF FINDER
 // ============================================================================
 
 struct XRefLocation
 {
-    uint32_t FileOffset;        // Instruction location in file
+    uint32_t FileOffset;        // Where the displacement appears in file
     uint32_t RVA;               // Instruction RVA
-    int32_t  Displacement;      // RIP-relative displacement in instruction
-    uint8_t  InstructionSize;   // Size of the instruction (5, 6, or 7 bytes)
-    uint8_t  InstructionType;   // 0 = LEA, 1 = MOV, 2 = other RIP-relative
+    int32_t  Displacement;      // The 4-byte signed displacement
+    uint8_t  InstructionSize;   // Assumed instruction size (5-7 bytes)
     bool     Found;
     
-    XRefLocation() : FileOffset(0), RVA(0), Displacement(0), InstructionSize(7), InstructionType(0), Found(false) {}
+    XRefLocation() : FileOffset(0), RVA(0), Displacement(0), InstructionSize(7), Found(false) {}
 };
 
 /*
-RIP-Relative Addressing in x64 - Register Agnostic:
+Register-Independent XREF Discovery:
 
-Modern compilers use various registers for RIP-relative addressing:
-  LEA RCX, [RIP + disp]  ; 48 8D 0D XX XX XX XX
-  LEA RDX, [RIP + disp]  ; 48 8D 15 XX XX XX XX
-  LEA R8,  [RIP + disp]  ; 4C 8D 05 XX XX XX XX
-  LEA R9,  [RIP + disp]  ; 4C 8D 0D XX XX XX XX
-  LEA R11, [RIP + disp]  ; 4C 8D 1D XX XX XX XX
-  MOV reg, [RIP + disp]  ; Various REX + opcode combinations
+Instead of matching instruction opcodes, we use pure math:
+  1. For every 4-byte aligned position in .text
+  2. Read the 4 bytes as a signed 32-bit displacement
+  3. Check if: (CurrentAddress + InstructionSize + Displacement) == TargetRVA
+  4. If true, we found an xref regardless of what instruction it belongs to
 
-Algorithm:
-  1. Scan code section for any 4-byte displacement
-  2. Calculate potential target: RVA + instruction_size + displacement
-  3. If target matches string RVA, we found an xref
-  4. Verify instruction encoding (basic sanity checks)
+This catches ALL RIP-relative references:
+  - LEA with any register (RCX, RDX, R8, R9, R11, etc.)
+  - MOV with any register
+  - CMP, TEST, ADD, SUB with RIP-relative operands
+  - Any future instruction encodings the compiler invents
+
+We try multiple instruction sizes (5, 6, 7 bytes) since the exact
+instruction length affects the RIP-relative calculation.
 */
 
 std::vector<XRefLocation> FindAllXRefsToRVA(
@@ -1288,80 +278,65 @@ std::vector<XRefLocation> FindAllXRefsToRVA(
 {
     std::vector<XRefLocation> results;
     
-    if (!CodeSection || CodeSize < 5)
+    if (!CodeSection || CodeSize < 4)
         return results;
     
-    // Scan entire code section for displacement values matching TargetRVA
-    for (size_t i = 0; i <= CodeSize - 5; i++)
+    // Scan every byte position (not just 4-byte aligned - compilers can emit unaligned)
+    for (size_t i = 0; i <= CodeSize - 4; i++)
     {
-        uint8_t* current = CodeSection + i;
+        // Read 4 bytes as potential displacement
+        int32_t disp = *reinterpret_cast<int32_t*>(CodeSection + i);
         
-        // Try instruction sizes 5, 6, and 7 bytes
+        // Try different instruction sizes (5, 6, 7 bytes are common for RIP-relative)
+        // The displacement is typically the LAST 4 bytes of the instruction
+        // So we check if: (InstructionRVA + InstSize + disp) == TargetRVA
+        
         for (uint8_t instSize = 5; instSize <= 7; instSize++)
         {
-            if (i + instSize > CodeSize)
-                break;
+            // For displacement at position i within the instruction
+            // The instruction started at (i - (instSize - 4))
+            // But we're scanning for displacement position, so:
+            // Target = RVA_of_disp + 4 + disp (RIP points to next instruction after disp)
+            // Actually: RIP at execution = InstructionAddr + InstSize
+            // So: Target = (CodeSectionRVA + i - (instSize - 4)) + instSize + disp
+            // Simplifies to: Target = CodeSectionRVA + i + 4 + disp
             
-            // Displacement can appear at different positions
-            for (uint8_t dispOffset = 0; dispOffset <= instSize - 4; dispOffset++)
+            // Wait, let me recalculate:
+            // If displacement is at byte offset i, and it's part of a 5/6/7 byte instruction
+            // The instruction starts at different positions depending on size
+            // But RIP-relative addressing always uses: Target = NextInstAddr + disp
+            // Where NextInstAddr = InstAddr + InstSize
+            
+            // If disp is at position i, and we assume it's the last 4 bytes of instruction:
+            // For 5-byte instruction: inst starts at i-1, RIP after = i+4, target = i+4+disp
+            // For 6-byte instruction: inst starts at i-2, RIP after = i+4, target = i+4+disp
+            // For 7-byte instruction: inst starts at i-3, RIP after = i+4, target = i+4+disp
+            
+            // All cases: target = CodeSectionRVA + i + 4 + disp
+            
+            uint32_t dispRVA = CodeSectionRVA + static_cast<uint32_t>(i);
+            int64_t potentialTarget = static_cast<int64_t>(dispRVA) + 4 + disp;
+            
+            if (potentialTarget == static_cast<int64_t>(TargetRVA))
             {
-                int32_t disp = *reinterpret_cast<int32_t*>(current + dispOffset);
+                XRefLocation xref;
                 
-                uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(i);
-                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
+                // Calculate instruction RVA (instruction starts before displacement)
+                // For a 7-byte instruction with displacement in last 4 bytes:
+                //   inst start = i - 3
+                // For 6-byte: inst start = i - 2
+                // For 5-byte: inst start = i - 1
                 
-                if (potentialTarget == static_cast<int64_t>(TargetRVA))
+                int32_t instStart = static_cast<int32_t>(i) - (instSize - 4);
+                
+                if (instStart >= 0)
                 {
-                    bool validInstruction = false;
-                    uint8_t instType = 2;
-                    
-                    // Verify instruction encoding
-                    if (dispOffset >= 2)
-                    {
-                        uint8_t b0 = current[0];
-                        uint8_t b1 = current[1];
-                        
-                        // REX.W prefix (0x48) - standard 64-bit operations
-                        if (b0 == 0x48)
-                        {
-                            if (b1 == 0x8D) { validInstruction = true; instType = 0; }  // LEA
-                            else if (b1 == 0x8B) { validInstruction = true; instType = 1; }  // MOV
-                            else if (b1 == 0x3B || b1 == 0x85 || b1 == 0x39 || b1 == 0x3D)
-                            { validInstruction = true; instType = 2; }  // CMP, TEST, etc
-                        }
-                        // REX.RW (0x4C) - R8-R15 register operations
-                        else if (b0 == 0x4C)
-                        {
-                            if (b1 == 0x8D) { validInstruction = true; instType = 0; }
-                            else if (b1 == 0x8B) { validInstruction = true; instType = 1; }
-                            else if (b1 == 0x3D || b1 == 0x39 || b1 == 0x85)
-                            { validInstruction = true; instType = 2; }
-                        }
-                        // REX.RXW (0x4D) - extended R8-R15 operations
-                        else if (b0 == 0x4D)
-                        {
-                            if (b1 == 0x8D || b1 == 0x8B) { validInstruction = true; instType = 0; }
-                        }
-                    }
-                    
-                    // Accept even without verification - compiler generates valid code
-                    if (!validInstruction)
-                    {
-                        validInstruction = true;
-                        instType = 2;
-                    }
-                    
-                    if (validInstruction)
-                    {
-                        XRefLocation xref;
-                        xref.FileOffset = static_cast<uint32_t>(i);
-                        xref.RVA = instRVA;
-                        xref.Displacement = disp;
-                        xref.InstructionSize = instSize;
-                        xref.InstructionType = instType;
-                        xref.Found = true;
-                        results.push_back(xref);
-                    }
+                    xref.FileOffset = static_cast<uint32_t>(instStart);
+                    xref.RVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
+                    xref.Displacement = disp;
+                    xref.InstructionSize = instSize;
+                    xref.Found = true;
+                    results.push_back(xref);
                 }
             }
         }
@@ -1370,68 +345,28 @@ std::vector<XRefLocation> FindAllXRefsToRVA(
     return results;
 }
 
-XRefLocation FindClosestXRefToRVA(
-    uint8_t* CodeSection,
-    size_t   CodeSize,
-    uint32_t CodeSectionRVA,
-    uint32_t TargetRVA,
-    uint32_t PreferredRVA = 0
-)
-{
-    std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(CodeSection, CodeSize, CodeSectionRVA, TargetRVA);
-    
-    if (xrefs.empty())
-        return XRefLocation();
-    
-    if (xrefs.size() == 1)
-        return xrefs[0];
-    
-    // Find closest to preferred RVA
-    if (PreferredRVA != 0)
-    {
-        XRefLocation closest = xrefs[0];
-        uint32_t minDist = abs(static_cast<int32_t>(xrefs[0].RVA) - static_cast<int32_t>(PreferredRVA));
-        
-        for (const auto& xref : xrefs)
-        {
-            uint32_t dist = abs(static_cast<int32_t>(xref.RVA) - static_cast<int32_t>(PreferredRVA));
-            if (dist < minDist)
-            {
-                minDist = dist;
-                closest = xref;
-            }
-        }
-        return closest;
-    }
-    
-    return xrefs[0];
-}
-
 // ============================================================================
-// GLOBAL OFFSET EXTRACTOR - FROM STRING XREF
+// GLOBAL OFFSET EXTRACTOR
 // ============================================================================
 
 struct GlobalOffset
 {
     std::string Marker;
-    uint32_t    GlobalRVA;      // RVA of the global (FNamePool or GUObjectArray)
-    int32_t     Displacement;   // Raw displacement value
+    uint32_t    GlobalRVA;
+    int32_t     Displacement;
     bool        Found;
     
     GlobalOffset() : GlobalRVA(0), Displacement(0), Found(false) {}
 };
 
 /*
-Once we find an instruction that loads our string address, we need to find
-the NEARBY instruction that loads FNamePool or GUObjectArray.
+Find Global Near XRef:
 
-Pattern:
-  LEA RDX, [RIP + string_disp]    ; loads "%d ansi FNames" into RDX
-  LEA RCX, [RIP + pool_disp]      ; loads FNamePool address into RCX
-  CALL printf
+Scan 0x20 bytes forward and backward from a string xref to find another
+RIP-relative instruction. That instruction likely points to the global
+(FNamePool or GUObjectArray).
 
-Scan Range: 0x20 bytes (32 bytes) forward and backward from string xref
-This catches compiler inline functions and nearby global accesses.
+Uses the same register-independent math as the xref finder.
 */
 
 GlobalOffset FindGlobalNearXRef(
@@ -1450,55 +385,49 @@ GlobalOffset FindGlobalNearXRef(
     uint8_t* code = Image.TextSection->Data;
     size_t codeSize = Image.TextSection->Size;
     
-    size_t xrefFileOffset = StringXRef.FileOffset;
-    
-    // Scan 0x20 (32) bytes backward and forward
+    size_t xrefPos = StringXRef.FileOffset;
     constexpr int32_t scanRange = 0x20;
     
+    // Scan backward then forward
     for (int direction = -1; direction <= 1; direction += 2)
     {
-        for (int offset = 7; offset <= scanRange; offset += 1)
+        for (int32_t offset = 7; offset <= scanRange; offset++)
         {
-            size_t scanPos = 0;
-            
+            size_t scanPos;
             if (direction == -1)
-                scanPos = xrefFileOffset - offset;
+                scanPos = xrefPos - offset;
             else
-                scanPos = xrefFileOffset + offset;
+                scanPos = xrefPos + offset;
             
-            if (scanPos < 7 || scanPos >= codeSize - 7)
+            if (scanPos < 4 || scanPos >= codeSize - 4)
                 continue;
             
-            uint8_t* inst = code + scanPos;
-            
-            // Skip the instruction that references our string
-            if (scanPos == xrefFileOffset)
+            // Skip if this is the string xref itself
+            if (scanPos == xrefPos)
                 continue;
             
-            // Check for RIP-relative LEA/MOV with any register
-            // REX.W prefix (0x48) or REX.RW (0x4C) or REX.RXW (0x4D)
-            bool isREX = (inst[0] == 0x48 || inst[0] == 0x4C || inst[0] == 0x4D);
+            // Read potential displacement at this position
+            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
             
-            if (isREX)
+            // Try instruction sizes 5-7
+            for (uint8_t instSize = 5; instSize <= 7; instSize++)
             {
-                uint8_t opcode = inst[1];
+                uint32_t dispRVA = CodeSectionRVA + static_cast<uint32_t>(scanPos);
+                int64_t targetRVA = static_cast<int64_t>(dispRVA) + 4 + disp;
                 
-                // LEA (0x8D) or MOV (0x8B)
-                bool isLEAorMOV = (opcode == 0x8D || opcode == 0x8B);
+                // Check if this displacement points somewhere in .data or .bss (likely a global)
+                // For now, accept any valid displacement that's within the image bounds
                 
-                if (isLEAorMOV)
+                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
+                
+                if (instStart >= 0 && instStart < static_cast<int32_t>(codeSize))
                 {
-                    uint8_t modRM = inst[2];
-                    uint8_t mod = (modRM >> 6) & 0x3;
-                    uint8_t rm = modRM & 0x7;
+                    // Basic sanity: displacement should be reasonable (not pointing outside image)
+                    // and not pointing to the same string we're already tracking
                     
-                    if (mod == 0 && rm == 5)  // RIP-relative
+                    if (targetRVA != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize + 
+                        *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
                     {
-                        int32_t disp = *reinterpret_cast<int32_t*>(inst + 3);
-                        uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(scanPos);
-                        
-                        int64_t targetRVA = static_cast<int64_t>(instRVA) + 7 + disp;
-                        
                         result.GlobalRVA = static_cast<uint32_t>(targetRVA);
                         result.Displacement = disp;
                         result.Found = true;
@@ -1510,6 +439,140 @@ GlobalOffset FindGlobalNearXRef(
     }
     
     return result;
+}
+
+// ============================================================================
+// MAIN SCANNER FUNCTIONS
+// ============================================================================
+
+void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
+{
+    std::cout << "\n[*] Scanning for FNamePool via string references..." << std::endl;
+    
+    if (!Image.TextSection)
+    {
+        std::cout << "[-] No .text section found" << std::endl;
+        return;
+    }
+    
+    for (const char* marker : TargetStrings::FNamePoolMarkers)
+    {
+        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
+        
+        // Step 1: Find string
+        StringLocation strLoc = FindStringInImage(Image, marker);
+        if (!strLoc.Found)
+        {
+            std::cout << "    [-] String not found" << std::endl;
+            continue;
+        }
+        
+        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
+        
+        // Step 2: Find all xrefs (register-independent)
+        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
+            Image.TextSection->Data,
+            Image.TextSection->Size,
+            Image.TextSection->VirtualAddress,
+            strLoc.RVA);
+        
+        if (xrefs.empty())
+        {
+            std::cout << "    [-] No xrefs found" << std::endl;
+            continue;
+        }
+        
+        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s)" << std::endl;
+        
+        // Step 3: Try each xref
+        for (const auto& xref : xrefs)
+        {
+            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA
+                      << " (disp: 0x" << xref.Displacement << ")" << std::endl;
+            
+            GlobalOffset global = FindGlobalNearXRef(
+                Image,
+                const_cast<XRefLocation&>(xref),
+                Image.TextSection->VirtualAddress,
+                marker);
+            
+            if (global.Found)
+            {
+                Result = global;
+                Result.Marker = marker;
+                std::cout << "    [+] FNamePool found at RVA: 0x"
+                          << std::hex << global.GlobalRVA << std::endl;
+                return;
+            }
+        }
+    }
+    
+    std::cout << "[-] FNamePool not found" << std::endl;
+}
+
+void ScanForGUObjectArray(PEImage& Image, GlobalOffset& Result)
+{
+    std::cout << "\n[*] Scanning for GUObjectArray via string references..." << std::endl;
+    
+    if (!Image.TextSection)
+    {
+        std::cout << "[-] No .text section found" << std::endl;
+        return;
+    }
+    
+    for (const char* marker : TargetStrings::GUObjectArrayMarkers)
+    {
+        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
+        
+        // Step 1: Find string
+        StringLocation strLoc = FindStringInImage(Image, marker);
+        if (!strLoc.Found)
+        {
+            std::cout << "    [-] String not found" << std::endl;
+            continue;
+        }
+        
+        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
+        
+        // Step 2: Find all xrefs (register-independent)
+        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
+            Image.TextSection->Data,
+            Image.TextSection->Size,
+            Image.TextSection->VirtualAddress,
+            strLoc.RVA);
+        
+        if (xrefs.empty())
+        {
+            std::cout << "    [-] No xrefs found" << std::endl;
+            continue;
+        }
+        
+        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s)" << std::endl;
+        
+        // Step 3: Try each xref
+        for (const auto& xref : xrefs)
+        {
+            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA
+                      << " (disp: 0x" << xref.Displacement << ")" << std::endl;
+            
+            GlobalOffset global = FindGlobalNearXRef(
+                Image,
+                const_cast<XRefLocation&>(xref),
+                Image.TextSection->VirtualAddress,
+                marker);
+            
+            if (global.Found)
+            {
+                Result = global;
+                Result.Marker = marker;
+                std::cout << "    [+] GUObjectArray found at RVA: 0x"
+                          << std::hex << global.GlobalRVA << std::endl;
+                return;
+            }
+        }
+    }
+    
+    std::cout << "[-] GUObjectArray not found" << std::endl;
 }
 
 // ============================================================================
@@ -1538,7 +601,7 @@ struct FileBuffer
         
         if (!file.is_open())
         {
-            std::cerr << "[!] Failed to open file: " << FilePath << std::endl;
+            std::cerr << "[!] Failed to open: " << FilePath << std::endl;
             return false;
         }
         
@@ -1549,7 +612,7 @@ struct FileBuffer
         
         if (!file.read(reinterpret_cast<char*>(Data), Size))
         {
-            std::cerr << "[!] Failed to read file into buffer" << std::endl;
+            std::cerr << "[!] Failed to read file" << std::endl;
             delete[] Data;
             Data = nullptr;
             Size = 0;
@@ -1562,148 +625,6 @@ struct FileBuffer
 };
 
 // ============================================================================
-// MAIN SCANNER LOGIC
-// ============================================================================
-
-void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
-{
-    std::cout << "\n[*] Scanning for FNamePool via string references..." << std::endl;
-    
-    if (!Image.TextSection)
-    {
-        std::cout << "[-] No .text section found" << std::endl;
-        return;
-    }
-    
-    for (const char* marker : TargetStrings::FNamePoolMarkers)
-    {
-        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
-        
-        // Step 1: Find the string
-        StringLocation strLoc = FindStringInImage(Image, marker);
-        
-        if (!strLoc.Found)
-        {
-            std::cout << "    [-] String not found" << std::endl;
-            continue;
-        }
-        
-        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
-        
-        // Step 2: Find all xrefs to the string (register-agnostic)
-        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
-            Image.TextSection->Data,
-            Image.TextSection->Size,
-            Image.TextSection->VirtualAddress,
-            strLoc.RVA
-        );
-        
-        if (xrefs.empty())
-        {
-            std::cout << "    [-] No xrefs found to string" << std::endl;
-            continue;
-        }
-        
-        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s) to string" << std::endl;
-        
-        // Step 3: Try each xref to find nearby global
-        for (const auto& xref : xrefs)
-        {
-            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA 
-                      << " (disp: 0x" << xref.Displacement 
-                      << ", size: " << std::dec << static_cast<int>(xref.InstructionSize) << ")" << std::endl;
-            
-            GlobalOffset global = FindGlobalNearXRef(
-                Image,
-                const_cast<XRefLocation&>(xref),
-                Image.TextSection->VirtualAddress,
-                marker
-            );
-            
-            if (global.Found)
-            {
-                Result = global;
-                Result.Marker = marker;
-                std::cout << "    [+] FNamePool global found at RVA: 0x" 
-                          << std::hex << global.GlobalRVA << std::endl;
-                return;
-            }
-        }
-    }
-    
-    std::cout << "[-] FNamePool not found via string references" << std::endl;
-}
-
-void ScanForGUObjectArray(PEImage& Image, GlobalOffset& Result)
-{
-    std::cout << "\n[*] Scanning for GUObjectArray via string references..." << std::endl;
-    
-    if (!Image.TextSection)
-    {
-        std::cout << "[-] No .text section found" << std::endl;
-        return;
-    }
-    
-    for (const char* marker : TargetStrings::GUObjectArrayMarkers)
-    {
-        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
-        
-        // Step 1: Find the string
-        StringLocation strLoc = FindStringInImage(Image, marker);
-        
-        if (!strLoc.Found)
-        {
-            std::cout << "    [-] String not found" << std::endl;
-            continue;
-        }
-        
-        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
-        
-        // Step 2: Find all xrefs to the string (register-agnostic)
-        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
-            Image.TextSection->Data,
-            Image.TextSection->Size,
-            Image.TextSection->VirtualAddress,
-            strLoc.RVA
-        );
-        
-        if (xrefs.empty())
-        {
-            std::cout << "    [-] No xrefs found to string" << std::endl;
-            continue;
-        }
-        
-        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s) to string" << std::endl;
-        
-        // Step 3: Try each xref to find nearby global
-        for (const auto& xref : xrefs)
-        {
-            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA 
-                      << " (disp: 0x" << xref.Displacement 
-                      << ", size: " << std::dec << static_cast<int>(xref.InstructionSize) << ")" << std::endl;
-            
-            GlobalOffset global = FindGlobalNearXRef(
-                Image,
-                const_cast<XRefLocation&>(xref),
-                Image.TextSection->VirtualAddress,
-                marker
-            );
-            
-            if (global.Found)
-            {
-                Result = global;
-                Result.Marker = marker;
-                std::cout << "    [+] GUObjectArray global found at RVA: 0x" 
-                          << std::hex << global.GlobalRVA << std::endl;
-                return;
-            }
-        }
-    }
-    
-    std::cout << "[-] GUObjectArray not found via string references" << std::endl;
-}
-
-// ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
 
@@ -1711,37 +632,33 @@ int main(int argc, char* argv[])
 {
     std::cout << "========================================" << std::endl;
     std::cout << "UE6 SDK Offset Extractor" << std::endl;
-    std::cout << "String-Reference Signature Scanner" << std::endl;
+    std::cout << "String-Reference Scanner (Register-Independent)" << std::endl;
     std::cout << "========================================" << std::endl;
     
     const char* targetFile = "FortniteClient-Win64-Shipping.exe";
     
     if (argc > 1)
-    {
         targetFile = argv[1];
-    }
     else
     {
         std::cout << "\nUsage: " << argv[0] << " [path_to_exe]" << std::endl;
         std::cout << "Using default: " << targetFile << std::endl;
     }
     
-    std::cout << "\n[*] Loading executable into memory buffer..." << std::endl;
+    std::cout << "\n[*] Loading executable..." << std::endl;
     
     FileBuffer buffer;
     if (!buffer.Load(targetFile))
     {
-        std::cout << "\n[!] Failed to load target file" << std::endl;
-        std::cout << "[!] Ensure FortniteClient-Win64-Shipping.exe is in the current directory" << std::endl;
-        std::cout << "[!] Or pass the full path as a command-line argument" << std::endl;
+        std::cout << "\n[!] Ensure file is in current directory or pass full path" << std::endl;
         std::cin.get();
         return 1;
     }
     
-    std::cout << "[+] File loaded successfully" << std::endl;
+    std::cout << "[+] File loaded" << std::endl;
     
-    // Parse PE image
-    std::cout << "\n[*] Parsing PE image structure..." << std::endl;
+    // Parse PE
+    std::cout << "\n[*] Parsing PE image..." << std::endl;
     
     PEImage image;
     image.Base = buffer.Data;
@@ -1752,74 +669,67 @@ int main(int argc, char* argv[])
     
     if (!ParsePEImage(buffer.Data, buffer.Size, image))
     {
-        std::cerr << "[!] Failed to parse PE image" << std::endl;
+        std::cerr << "[!] Failed to parse PE" << std::endl;
         std::cin.get();
         return 1;
     }
     
     std::cout << "[+] Image base: 0x" << std::hex << image.ImageBase << std::endl;
-    std::cout << "[+] Sections found: " << std::dec << image.Sections.size() << std::endl;
+    std::cout << "[+] Sections: " << std::dec << image.Sections.size() << std::endl;
     
     if (image.TextSection)
-        std::cout << "    .text: RVA=0x" << std::hex << image.TextSection->VirtualAddress 
+        std::cout << "    .text:  RVA=0x" << std::hex << image.TextSection->VirtualAddress
                   << ", Size=0x" << image.TextSection->Size << std::endl;
     if (image.RDataSection)
-        std::cout << "    .rdata: RVA=0x" << std::hex << image.RDataSection->VirtualAddress 
+        std::cout << "    .rdata: RVA=0x" << std::hex << image.RDataSection->VirtualAddress
                   << ", Size=0x" << image.RDataSection->Size << std::endl;
     if (image.DataSection)
-        std::cout << "    .data: RVA=0x" << std::hex << image.DataSection->VirtualAddress 
+        std::cout << "    .data:  RVA=0x" << std::hex << image.DataSection->VirtualAddress
                   << ", Size=0x" << image.DataSection->Size << std::endl;
     
-    // Scan for FNamePool
-    GlobalOffset fNamePoolOffset;
-    ScanForFNamePool(image, fNamePoolOffset);
-    
-    // Scan for GUObjectArray
-    GlobalOffset gUObjectArrayOffset;
-    ScanForGUObjectArray(image, gUObjectArrayOffset);
+    // Scan for offsets
+    GlobalOffset fNamePool, gUObjectArray;
+    ScanForFNamePool(image, fNamePool);
+    ScanForGUObjectArray(image, gUObjectArray);
     
     // Print results
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "EXTRACTION RESULTS" << std::endl;
+    std::cout << "RESULTS" << std::endl;
     std::cout << std::string(60, '=') << std::endl;
     
-    if (fNamePoolOffset.Found)
+    if (fNamePool.Found)
     {
         std::cout << "\n[FNamePool]" << std::endl;
-        std::cout << "  Marker string: \"" << fNamePoolOffset.Marker << "\"" << std::endl;
-        std::cout << "  RVA: 0x" << std::hex << fNamePoolOffset.GlobalRVA << std::endl;
-        std::cout << "  ImageBase + RVA = 0x" << std::hex 
-                  << (image.ImageBase + fNamePoolOffset.GlobalRVA) << std::endl;
+        std::cout << "  Marker: \"" << fNamePool.Marker << "\"" << std::endl;
+        std::cout << "  RVA: 0x" << std::hex << fNamePool.GlobalRVA << std::endl;
+        std::cout << "  VA:  0x" << std::hex << (image.ImageBase + fNamePool.GlobalRVA) << std::endl;
     }
     
-    if (gUObjectArrayOffset.Found)
+    if (gUObjectArray.Found)
     {
         std::cout << "\n[GUObjectArray]" << std::endl;
-        std::cout << "  Marker string: \"" << gUObjectArrayOffset.Marker << "\"" << std::endl;
-        std::cout << "  RVA: 0x" << std::hex << gUObjectArrayOffset.GlobalRVA << std::endl;
-        std::cout << "  ImageBase + RVA = 0x" << std::hex 
-                  << (image.ImageBase + gUObjectArrayOffset.GlobalRVA) << std::endl;
+        std::cout << "  Marker: \"" << gUObjectArray.Marker << "\"" << std::endl;
+        std::cout << "  RVA: 0x" << std::hex << gUObjectArray.GlobalRVA << std::endl;
+        std::cout << "  VA:  0x" << std::hex << (image.ImageBase + gUObjectArray.GlobalRVA) << std::endl;
     }
     
-    if (fNamePoolOffset.Found && gUObjectArrayOffset.Found)
+    if (fNamePool.Found && gUObjectArray.Found)
     {
         std::cout << "\n" << std::string(60, '-') << std::endl;
-        std::cout << "COPY-PASTE FOR OFFSETS NAMESPACE:" << std::endl;
+        std::cout << "COPY-PASTE FOR YOUR CODE:" << std::endl;
         std::cout << std::string(60, '-') << std::endl;
-        std::cout << "\n// String-reference extracted offsets" << std::endl;
-        std::cout << "namespace Offsets" << std::endl;
+        std::cout << "\nnamespace Offsets" << std::endl;
         std::cout << "{" << std::endl;
-        std::cout << "    constexpr uintptr_t FNamePoolOffset   = 0x" 
-                  << std::hex << fNamePoolOffset.GlobalRVA << ";" << std::endl;
-        std::cout << "    constexpr uintptr_t GUObjectArrayOffset = 0x" 
-                  << std::hex << gUObjectArrayOffset.GlobalRVA << ";" << std::endl;
+        std::cout << "    constexpr uintptr_t FNamePoolOffset   = 0x"
+                  << std::hex << fNamePool.GlobalRVA << ";" << std::endl;
+        std::cout << "    constexpr uintptr_t GUObjectArrayOffset = 0x"
+                  << std::hex << gUObjectArray.GlobalRVA << ";" << std::endl;
         std::cout << "}" << std::endl;
     }
     
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    
-    std::cout << "\n[*] Scan complete. Press Enter to exit..." << std::endl;
+    std::cout << "\n[*] Done. Press Enter to exit..." << std::endl;
     std::cin.get();
     
-    return (fNamePoolOffset.Found && gUObjectArrayOffset.Found) ? 0 : 1;
+    return (fNamePool.Found && gUObjectArray.Found) ? 0 : 1;
 }
