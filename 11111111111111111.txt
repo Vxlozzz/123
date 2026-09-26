@@ -1,923 +1,465 @@
+The complete file is already on disk from the last step — let me verify its current state and rebuild it fresh to confirm everything you listed is in place:
+
+The file is confirmed on disk, builds clean, and runs correctly (just verified against where.exe too). Let me pull the complete source so I can give it to you in full:
+
+Here's the complete, self-contained pe_parser.cpp — all three pieces you listed are in place (packed structs with static_assert size checks, the full RvaToFileOffset translation, and the main() entry that slurps the file via std::ifstream and prints data directories + section headers). It compiles clean at /W4 with only standard libraries:
+
+cpp
+Copy
+// ============================================================================
+//  pe_parser.cpp — educational PE parser
+//
+//  Reads a Windows 64-bit PE file from disk and prints its structure:
+//  DOS header, NT headers (file + optional), data directories, sections.
+//
+//  Standard C++ only: <iostream>, <fstream>. No Windows headers, no driver,
+//  no process access. Pure static analysis of a file on disk.
+//
+//  Build:  cl /std:c++17 /EHsc pe_parser.cpp
+//  Usage:  pe_parser.exe <path-to-pe-file>
+// ============================================================================
+
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <iostream>
 #include <fstream>
-#include <vector>
 #include <string>
+#include <vector>
+#include <iomanip>
 
 // ============================================================================
-// STRING-REFERENCE SIGNATURE SCANNER - SINGLE FILE BUILD
+//  ON-DISK STRUCTURES (packed, little-endian — as they appear in the file)
 // ============================================================================
-
-namespace TargetStrings
-{
-    // FNamePool string references (stable across UE versions)
-    constexpr const char* FNamePoolMarkers[] = {
-        "%d ansi FNames",      // FNamePool::DumpStats output
-        "bIsPureAnsi",         // FNameEntry property check
-        "FNamePool",           // Debug/assert messages
-        "Invalid FName",       // Error handling code
-        "Unable to find",      // FName lookup error
-        "FName ",              // FName prefix in logs
-    };
-
-    // GUObjectArray string references (stable across UE versions)
-    constexpr const char* GUObjectArrayMarkers[] = {
-        "gc.MaxObjects",                    // GC config variable near GUObjectArray init
-        "LoadTimeFileForCommandlet",        // Object loading code
-        "GUObjectArray",                    // Direct reference in debug builds
-        "ObjObjects",                       // Alternative global name
-        "MaxObjects",                       // GC limit variable
-        "Object count",                     // Debug output
-    };
-}
-
-// ============================================================================
-// PE PARSER - MINIMAL HEADERS
-// ============================================================================
-
-struct PESection
-{
-    std::string Name;
-    uint8_t* Data;
-    size_t      Size;
-    uint32_t    VirtualAddress;
-    uint32_t    RawOffset;
-    uint32_t    Characteristics;
-};
-
-struct PEImage
-{
-    uint8_t* Base;
-    size_t                 Size;
-    uint32_t               ImageBase;
-    std::vector<PESection> Sections;
-    PESection* TextSection;
-    PESection* DataSection;
-    PESection* RDataSection;
-};
 
 #pragma pack(push, 1)
-struct DOSHeader
-{
-    uint16_t e_magic;
-    uint16_t e_cblp, e_cp, e_crlc, e_cparhdr, e_minalloc, e_maxalloc;
-    uint16_t e_ss, e_sp, e_csum, e_ip, e_cs, e_lfarlc, e_ovno;
-    uint16_t e_res[4], e_oemid, e_oeminfo, e_res2[10];
-    int32_t  e_lfanew;
-};
 
+// --- DOS header (64 bytes). Only e_magic and e_lfanew matter to us. --------
+struct DosHeader
+{
+    uint16_t e_magic;       // 'MZ' (0x5A4D)
+    uint16_t e_cblp;        // bytes on last page
+    uint16_t e_cp;          // pages in file
+    uint16_t e_crlc;        // relocations
+    uint16_t e_cparhdr;     // size of header in paragraphs
+    uint16_t e_minalloc;
+    uint16_t e_maxalloc;
+    uint16_t e_ss;
+    uint16_t e_sp;
+    uint16_t e_csum;
+    uint16_t e_ip;
+    uint16_t e_cs;
+    uint16_t e_lfarlc;      // file address of relocation table
+    uint16_t e_ovno;        // overlay number
+    uint16_t e_res[4];      // reserved
+    uint16_t e_oemid;
+    uint16_t e_oeminfo;
+    uint16_t e_res2[10];    // reserved
+    int32_t  e_lfanew;      // FILE offset of the NT headers  <-- the key field
+};
+static_assert(sizeof(DosHeader) == 64, "DOS header must be 64 bytes");
+
+// --- PE file header (20 bytes) — follows the 4-byte 'PE\0\0' signature -----
 struct FileHeader
 {
-    uint16_t Machine, NumberOfSections;
-    uint32_t TimeDateStamp, PointerToSymbolTable, NumberOfSymbols;
-    uint16_t SizeOfOptionalHeader, Characteristics;
+    uint16_t Machine;              // e.g. 0x8664 = x64
+    uint16_t NumberOfSections;
+    uint32_t TimeDateStamp;        // link time (UTC unix time)
+    uint32_t PointerToSymbolTable;
+    uint32_t NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader;
+    uint16_t Characteristics;      // e.g. 0x0022 = executable image, large-address-aware
 };
+static_assert(sizeof(FileHeader) == 20, "File header must be 20 bytes");
 
-struct OptionalHeader64
+// --- Optional header, magic 0x20B = PE32+ (64-bit) --------------------------
+struct OptionalHeaderPE32Plus
 {
-    uint16_t Magic;
-    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
-    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
-    uint32_t AddressOfEntryPoint, BaseOfCode;
-    uint64_t ImageBase;
-    uint32_t SectionAlignment, FileAlignment;
-    uint16_t MajorOperatingSystemVersion, MinorOperatingSystemVersion;
-    uint16_t MajorImageVersion, MinorImageVersion;
-    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
-    uint32_t Win32VersionValue, SizeOfImage, SizeOfHeaders, CheckSum;
-    uint16_t Subsystem, DllCharacteristics;
-    uint64_t SizeOfStackReserve, SizeOfStackCommit, SizeOfHeapReserve, SizeOfHeapCommit;
-    uint32_t LoaderFlags, NumberOfRvaAndSizes;
+    uint16_t Magic;                // 0x20B for PE32+
+    uint8_t  MajorLinkerVersion;
+    uint8_t  MinorLinkerVersion;
+    uint32_t SizeOfCode;
+    uint32_t SizeOfInitializedData;
+    uint32_t SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint;  // RVA of entry point
+    uint32_t BaseOfCode;           // RVA of start of code
+    uint64_t ImageBase;            // preferred load address
+    uint32_t SectionAlignment;     // usually 0x1000
+    uint32_t FileAlignment;        // usually 0x200
+    uint16_t MajorOperatingSystemVersion;
+    uint16_t MinorOperatingSystemVersion;
+    uint16_t MajorImageVersion;
+    uint16_t MinorImageVersion;
+    uint16_t MajorSubsystemVersion;
+    uint16_t MinorSubsystemVersion;
+    uint32_t Win32VersionValue;
+    uint32_t SizeOfImage;          // total image size in memory
+    uint32_t SizeOfHeaders;        // combined size of DOS+NT+section headers
+    uint32_t CheckSum;
+    uint16_t Subsystem;            // 2 = GUI, 3 = console
+    uint16_t DllCharacteristics;   // ASLR, CFG, NX flags live here
+    uint64_t SizeOfStackReserve;
+    uint64_t SizeOfStackCommit;
+    uint64_t SizeOfHeapReserve;
+    uint64_t SizeOfHeapCommit;
+    uint32_t LoaderFlags;
+    uint32_t NumberOfRvaAndSizes;  // number of valid DataDirectory entries
+    // DataDirectory[16] follows immediately (8 bytes each, not in this struct)
+};
+static_assert(sizeof(OptionalHeaderPE32Plus) == 112, "PE32+ optional header must be 112 bytes");
+
+// --- One data directory entry (8 bytes) --------------------------------------
+struct DataDirectory
+{
+    uint32_t VirtualAddress;   // RVA
+    uint32_t Size;
 };
 
+// --- Section header (40 bytes) -----------------------------------------------
 struct SectionHeader
 {
-    char     Name[8];
-    uint32_t VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData;
-    uint32_t PointerToRelocations, PointerToLinenumbers;
-    uint16_t NumberOfRelocations, NumberOfLinenumbers;
+    char     Name[8];               // short name, NUL-padded ("May be longer" for objects)
+    uint32_t VirtualSize;           // size in memory (can exceed raw size)
+    uint32_t VirtualAddress;        // RVA of section start
+    uint32_t SizeOfRawData;         // size on disk (file-aligned)
+    uint32_t PointerToRawData;      // file offset of section start
+    uint32_t PointerToRelocations;
+    uint32_t PointerToLinenumbers;
+    uint16_t NumberOfRelocations;
+    uint16_t NumberOfLinenumbers;
     uint32_t Characteristics;
 };
+static_assert(sizeof(SectionHeader) == 40, "Section header must be 40 bytes");
+
 #pragma pack(pop)
 
-bool ParsePEImage(uint8_t* Buffer, size_t BufferSize, PEImage& Image)
-{
-    if (BufferSize < sizeof(DOSHeader))
-        return false;
-
-    DOSHeader* dos = reinterpret_cast<DOSHeader*>(Buffer);
-    if (dos->e_magic != 0x5A4D)
-        return false;
-
-    int32_t peOffset = dos->e_lfanew;
-    if (peOffset < 0 || peOffset + 4 + sizeof(FileHeader) > BufferSize)
-        return false;
-
-    uint32_t* peSig = reinterpret_cast<uint32_t*>(Buffer + peOffset);
-    if (*peSig != 0x00004550)
-        return false;
-
-    FileHeader* file = reinterpret_cast<FileHeader*>(Buffer + peOffset + 4);
-    OptionalHeader64* opt = reinterpret_cast<OptionalHeader64*>(
-        Buffer + peOffset + 4 + sizeof(FileHeader));
-
-    if (opt->Magic != 0x20b)
-        return false;
-
-    Image.ImageBase = static_cast<uint32_t>(opt->ImageBase);
-
-    SectionHeader* sections = reinterpret_cast<SectionHeader*>(
-        Buffer + peOffset + 4 + sizeof(FileHeader) + file->SizeOfOptionalHeader);
-
-    for (uint16_t i = 0; i < file->NumberOfSections; i++)
-    {
-        SectionHeader* sh = &sections[i];
-        PESection section;
-        section.Name = std::string(sh->Name, strnlen(sh->Name, 8));
-        section.VirtualAddress = sh->VirtualAddress;
-        section.RawOffset = sh->PointerToRawData;
-        section.Size = sh->SizeOfRawData;
-        section.Characteristics = sh->Characteristics;
-        section.Data = Buffer + sh->PointerToRawData;
-        Image.Sections.push_back(section);
-
-        if (section.Name == ".text")
-            Image.TextSection = &Image.Sections.back();
-        else if (section.Name == ".data")
-            Image.DataSection = &Image.Sections.back();
-        else if (section.Name == ".rdata")
-            Image.RDataSection = &Image.Sections.back();
-    }
-
-    return true;
-}
-
 // ============================================================================
-// STRING LOCATOR
+//  SMALL HELPERS
 // ============================================================================
 
-struct StringLocation
+// A PE file offset <-> RVA. Sections are laid out differently on disk than in
+// memory; this walks the section table to translate.
+bool RvaToFileOffset(uint32_t rva, const std::vector<SectionHeader>& sections, uint32_t& outOffset)
 {
-    uint32_t FileOffset;
-    uint32_t RVA;
-    bool     Found;
-
-    StringLocation() : FileOffset(0), RVA(0), Found(false) {}
-};
-
-StringLocation FindStringInSection(
-    uint8_t* SectionData,
-    size_t      SectionSize,
-    uint32_t    SectionRVA,
-    const char* TargetString
-)
-{
-    StringLocation result;
-    size_t len = strlen(TargetString);
-
-    if (len == 0 || !SectionData)
-        return result;
-
-    for (size_t i = 0; i <= SectionSize - len; i++)
+    for (const auto& s : sections)
     {
-        bool match = true;
-        for (size_t j = 0; j < len; j++)
+        const uint32_t vsize = s.VirtualSize ? s.VirtualSize : s.SizeOfRawData;
+        if (rva >= s.VirtualAddress && rva < s.VirtualAddress + vsize)
         {
-            if (SectionData[i + j] != static_cast<uint8_t>(TargetString[j]))
-            {
-                match = false;
-                break;
-            }
-        }
-
-        if (match)
-        {
-            result.FileOffset = static_cast<uint32_t>(i);
-            result.RVA = SectionRVA + static_cast<uint32_t>(i);
-            result.Found = true;
-            return result;
+            const uint32_t delta = rva - s.VirtualAddress;
+            // If the section is uninitialized (BSS-like), there is no raw data.
+            if (delta >= s.SizeOfRawData)
+                return false;
+            outOffset = s.PointerToRawData + delta;
+            return true;
         }
     }
-
-    return result;
-}
-
-StringLocation FindStringInImage(PEImage& Image, const char* TargetString)
-{
-    StringLocation result;
-
-    // Check .rdata first (strings typically here)
-    if (Image.RDataSection)
+    // Headers live before the first section; RVA == file offset there.
+    if (rva < 0x1000)
     {
-        result = FindStringInSection(
-            Image.RDataSection->Data,
-            Image.RDataSection->Size,
-            Image.RDataSection->VirtualAddress,
-            TargetString);
-        if (result.Found)
-            return result;
-    }
-
-    // Fallback to .data
-    if (Image.DataSection)
-    {
-        result = FindStringInSection(
-            Image.DataSection->Data,
-            Image.DataSection->Size,
-            Image.DataSection->VirtualAddress,
-            TargetString);
-        if (result.Found)
-            return result;
-    }
-
-    // Last resort: entire binary
-    result = FindStringInSection(Image.Base, Image.Size, 0, TargetString);
-    return result;
-}
-
-// ============================================================================
-// REGISTER-INDEPENDENT XREF FINDER
-// ============================================================================
-
-struct XRefLocation
-{
-    uint32_t FileOffset;        // Where the displacement appears in file
-    uint32_t RVA;               // Instruction RVA
-    int32_t  Displacement;      // The 4-byte signed displacement
-    uint8_t  InstructionSize;   // Assumed instruction size (5-7 bytes)
-    bool     Found;
-
-    XRefLocation() : FileOffset(0), RVA(0), Displacement(0), InstructionSize(7), Found(false) {}
-};
-
-/*
-Register-Independent XREF Discovery:
-
-Instead of matching instruction opcodes, we use pure math:
-  1. For every 4-byte aligned position in .text
-  2. Read the 4 bytes as a signed 32-bit displacement
-  3. Check if: (CurrentAddress + InstructionSize + Displacement) == TargetRVA
-  4. If true, we found an xref regardless of what instruction it belongs to
-
-This catches ALL RIP-relative references:
-  - LEA with any register (RCX, RDX, R8, R9, R11, etc.)
-  - MOV with any register
-  - CMP, TEST, ADD, SUB with RIP-relative operands
-  - Any future instruction encodings the compiler invents
-
-We try multiple instruction sizes (5, 6, 7 bytes) since the exact
-instruction length affects the RIP-relative calculation.
-*/
-
-
-GlobalOffset FindGlobalNearXRef(
-    PEImage& Image,
-    XRefLocation& StringXRef,
-    uint32_t      CodeSectionRVA,
-    const char* MarkerName
-)
-{
-    GlobalOffset result;
-    result.Marker = MarkerName;
-
-    if (!Image.TextSection || !StringXRef.Found)
-        return result;
-
-    uint8_t* code = Image.TextSection->Data;
-    size_t codeSize = Image.TextSection->Size;
-
-    size_t xrefPos = StringXRef.FileOffset;
-    constexpr int32_t scanRange = 0x20;
-
-    // Scan backward then forward
-    for (int direction = -1; direction <= 1; direction += 2)
-    {
-        for (int32_t offset = 7; offset <= scanRange; offset++)
-        {
-            size_t scanPos;
-            if (direction == -1)
-                scanPos = xrefPos - offset;
-            else
-                scanPos = xrefPos + offset;
-
-            if (scanPos < 4 || scanPos >= codeSize - 4)
-                continue;
-
-            // Skip if this is the string xref itself
-            if (scanPos == xrefPos)
-                continue;
-
-            // Read potential displacement at this position
-            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
-
-            // Try instruction sizes 5-7
-            for (uint8_t instSize = 5; instSize <= 7; instSize++)
-            {
-                // Calculate instruction's starting address
-                // Displacement is at position scanPos within the instruction
-                // instStart = scanPos - (instSize - 4)
-                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
-
-                if (instStart < 0)
-                    continue;
-
-                // Calculate instruction RVA from code section base
-                uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
-
-                // Calculate target address using RIP-relative formula:
-                // Target = InstructionEnd + Displacement
-                // Target = (instRVA + instSize) + disp
-                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
-
-                // Verify this isn't pointing to our string (different xref)
-                if (potentialTarget != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize +
-                    *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
-                {
-                    result.GlobalRVA = static_cast<uint32_t>(potentialTarget);
-                    result.Displacement = disp;
-                    result.Found = true;
-                    return result;
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-{
-    GlobalOffset result;
-    result.Marker = MarkerName;
-
-    if (!Image.TextSection || !StringXRef.Found)
-        return result;
-
-    uint8_t* code = Image.TextSection->Data;
-    size_t codeSize = Image.TextSection->Size;
-
-    size_t xrefPos = StringXRef.FileOffset;
-    constexpr int32_t scanRange = 0x20;
-
-    // Scan backward then forward
-    for (int direction = -1; direction <= 1; direction += 2)
-    {
-        for (int32_t offset = 7; offset <= scanRange; offset++)
-        {
-            size_t scanPos;
-            if (direction == -1)
-                scanPos = xrefPos - offset;
-            else
-                scanPos = xrefPos + offset;
-
-            if (scanPos < 4 || scanPos >= codeSize - 4)
-                continue;
-
-            // Skip if this is the string xref itself
-            if (scanPos == xrefPos)
-                continue;
-
-            // Read potential displacement at this position
-            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
-
-            // Try instruction sizes 5-7
-            for (uint8_t instSize = 5; instSize <= 7; instSize++)
-            {
-                // Calculate instruction's starting address
-                // Displacement is at position scanPos within the instruction
-                // instStart = scanPos - (instSize - 4)
-                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
-
-                if (instStart < 0)
-                    continue;
-
-                // Calculate instruction RVA from code section base
-                uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
-
-                // Calculate target address using RIP-relative formula:
-                // Target = InstructionEnd + Displacement
-                // Target = (instRVA + instSize) + disp
-                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
-
-                // Verify this isn't pointing to our string (different xref)
-                if (potentialTarget != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize +
-                    *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
-                {
-                    result.GlobalRVA = static_cast<uint32_t>(potentialTarget);
-                    result.Displacement = disp;
-                    result.Found = true;
-                    return result;
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-{
-    std::vector<XRefLocation> results;
-
-    if (!CodeSection || CodeSize < 4)
-        return results;
-
-    // Scan every byte position as potential displacement location
-    for (size_t i = 0; i <= CodeSize - 4; i++)
-    {
-        // Read 4 bytes as potential signed RIP-relative displacement
-        int32_t disp = *reinterpret_cast<int32_t*>(CodeSection + i);
-
-        // Try different instruction sizes (5, 6, 7 bytes are common for RIP-relative)
-        for (uint8_t instSize = 5; instSize <= 7; instSize++)
-        {
-            // Calculate instruction's starting address
-            // Displacement is at position i within the instruction
-            // For instSize bytes total with 4-byte displacement at the end:
-            //   instStart = i - (instSize - 4)
-            int32_t instStart = static_cast<int32_t>(i) - (instSize - 4);
-
-            if (instStart < 0)
-                continue;
-
-            // Calculate instruction RVA from code section base
-            uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
-
-            // Calculate target address using RIP-relative formula:
-            // RIP points to the next instruction (instruction end)
-            // Target = InstructionEnd + Displacement
-            // Target = (instRVA + instSize) + disp
-            int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
-
-            if (potentialTarget == static_cast<int64_t>(TargetRVA))
-            {
-                XRefLocation xref;
-                xref.FileOffset = static_cast<uint32_t>(instStart);
-                xref.RVA = instRVA;
-                xref.Displacement = disp;
-                xref.InstructionSize = instSize;
-                xref.Found = true;
-                results.push_back(xref);
-            }
-        }
-    }
-
-    return results;
-}
-
-{
-    std::vector<XRefLocation> results;
-
-    if (!CodeSection || CodeSize < 4)
-        return results;
-
-    // Scan every byte position (not just 4-byte aligned - compilers can emit unaligned)
-    for (size_t i = 0; i <= CodeSize - 4; i++)
-    {
-        // Read 4 bytes as potential displacement
-        int32_t disp = *reinterpret_cast<int32_t*>(CodeSection + i);
-
-        // Try different instruction sizes (5, 6, 7 bytes are common for RIP-relative)
-        // The displacement is typically the LAST 4 bytes of the instruction
-        // So we check if: (InstructionRVA + InstSize + disp) == TargetRVA
-
-        for (uint8_t instSize = 5; instSize <= 7; instSize++)
-        {
-            // For displacement at position i within the instruction
-            // The instruction started at (i - (instSize - 4))
-            // But we're scanning for displacement position, so:
-            // Target = RVA_of_disp + 4 + disp (RIP points to next instruction after disp)
-            // Actually: RIP at execution = InstructionAddr + InstSize
-            // So: Target = (CodeSectionRVA + i - (instSize - 4)) + instSize + disp
-            // Simplifies to: Target = CodeSectionRVA + i + 4 + disp
-
-            // Wait, let me recalculate:
-            // If displacement is at byte offset i, and it's part of a 5/6/7 byte instruction
-            // The instruction starts at different positions depending on size
-            // But RIP-relative addressing always uses: Target = NextInstAddr + disp
-            // Where NextInstAddr = InstAddr + InstSize
-
-            // If disp is at position i, and we assume it's the last 4 bytes of instruction:
-            // For 5-byte instruction: inst starts at i-1, RIP after = i+4, target = i+4+disp
-            // For 6-byte instruction: inst starts at i-2, RIP after = i+4, target = i+4+disp
-            // For 7-byte instruction: inst starts at i-3, RIP after = i+4, target = i+4+disp
-
-            // All cases: target = CodeSectionRVA + i + 4 + disp
-
-            uint32_t dispRVA = CodeSectionRVA + static_cast<uint32_t>(i);
-            int64_t potentialTarget = static_cast<int64_t>(dispRVA) + 4 + disp;
-
-            if (potentialTarget == static_cast<int64_t>(TargetRVA))
-            {
-                XRefLocation xref;
-
-                // Calculate instruction RVA (instruction starts before displacement)
-                // For a 7-byte instruction with displacement in last 4 bytes:
-                //   inst start = i - 3
-                // For 6-byte: inst start = i - 2
-                // For 5-byte: inst start = i - 1
-
-                int32_t instStart = static_cast<int32_t>(i) - (instSize - 4);
-
-                if (instStart >= 0)
-                {
-                    xref.FileOffset = static_cast<uint32_t>(instStart);
-                    xref.RVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
-                    xref.Displacement = disp;
-                    xref.InstructionSize = instSize;
-                    xref.Found = true;
-                    results.push_back(xref);
-                }
-            }
-        }
-    }
-
-    return results;
-}
-
-// ============================================================================
-// GLOBAL OFFSET EXTRACTOR
-// ============================================================================
-
-struct GlobalOffset
-{
-    std::string Marker;
-    uint32_t    GlobalRVA;
-    int32_t     Displacement;
-    bool        Found;
-
-    GlobalOffset() : GlobalRVA(0), Displacement(0), Found(false) {}
-};
-
-/*
-Find Global Near XRef:
-
-Scan 0x20 bytes forward and backward from a string xref to find another
-RIP-relative instruction. That instruction likely points to the global
-(FNamePool or GUObjectArray).
-
-Uses the same register-independent math as the xref finder.
-*/
-
-GlobalOffset FindGlobalNearXRef(
-    PEImage& Image,
-    XRefLocation& StringXRef,
-    uint32_t      CodeSectionRVA,
-    const char* MarkerName
-)
-{
-    GlobalOffset result;
-    result.Marker = MarkerName;
-
-    if (!Image.TextSection || !StringXRef.Found)
-        return result;
-
-    uint8_t* code = Image.TextSection->Data;
-    size_t codeSize = Image.TextSection->Size;
-
-    size_t xrefPos = StringXRef.FileOffset;
-    constexpr int32_t scanRange = 0x20;
-
-    // Scan backward then forward
-    for (int direction = -1; direction <= 1; direction += 2)
-    {
-        for (int32_t offset = 7; offset <= scanRange; offset++)
-        {
-            size_t scanPos;
-            if (direction == -1)
-                scanPos = xrefPos - offset;
-            else
-                scanPos = xrefPos + offset;
-
-            if (scanPos < 4 || scanPos >= codeSize - 4)
-                continue;
-
-            // Skip if this is the string xref itself
-            if (scanPos == xrefPos)
-                continue;
-
-            // Read potential displacement at this position
-            int32_t disp = *reinterpret_cast<int32_t*>(code + scanPos);
-
-            // Try instruction sizes 5-7
-            for (uint8_t instSize = 5; instSize <= 7; instSize++)
-            {
-                uint32_t dispRVA = CodeSectionRVA + static_cast<uint32_t>(scanPos);
-                int64_t targetRVA = static_cast<int64_t>(dispRVA) + 4 + disp;
-
-                // Check if this displacement points somewhere in .data or .bss (likely a global)
-                // For now, accept any valid displacement that's within the image bounds
-
-                int32_t instStart = static_cast<int32_t>(scanPos) - (instSize - 4);
-
-                if (instStart >= 0 && instStart < static_cast<int32_t>(codeSize))
-                {
-                    // Basic sanity: displacement should be reasonable (not pointing outside image)
-                    // and not pointing to the same string we're already tracking
-
-                    if (targetRVA != static_cast<int64_t>(StringXRef.RVA + StringXRef.InstructionSize +
-                        *reinterpret_cast<int32_t*>(code + xrefPos + (StringXRef.InstructionSize - 4))))
-                    {
-                        result.GlobalRVA = static_cast<uint32_t>(targetRVA);
-                        result.Displacement = disp;
-                        result.Found = true;
-                        return result;
-                    }
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-// ============================================================================
-// MAIN SCANNER FUNCTIONS
-// ============================================================================
-
-void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
-{
-    std::cout << "\n[*] Scanning for FNamePool via string references..." << std::endl;
-
-    if (!Image.TextSection)
-    {
-        std::cout << "[-] No .text section found" << std::endl;
-        return;
-    }
-
-    for (const char* marker : TargetStrings::FNamePoolMarkers)
-    {
-        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
-
-        // Step 1: Find string
-        StringLocation strLoc = FindStringInImage(Image, marker);
-        if (!strLoc.Found)
-        {
-            std::cout << "    [-] String not found" << std::endl;
-            continue;
-        }
-
-        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
-
-        // Step 2: Find all xrefs (register-independent)
-        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
-            Image.TextSection->Data,
-            Image.TextSection->Size,
-            Image.TextSection->VirtualAddress,
-            strLoc.RVA);
-
-        if (xrefs.empty())
-        {
-            std::cout << "    [-] No xrefs found" << std::endl;
-            continue;
-        }
-
-        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s)" << std::endl;
-
-        // Step 3: Try each xref
-        for (const auto& xref : xrefs)
-        {
-            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA
-                << " (disp: 0x" << xref.Displacement << ")" << std::endl;
-
-            GlobalOffset global = FindGlobalNearXRef(
-                Image,
-                const_cast<XRefLocation&>(xref),
-                Image.TextSection->VirtualAddress,
-                marker);
-
-            if (global.Found)
-            {
-                Result = global;
-                Result.Marker = marker;
-                std::cout << "    [+] FNamePool found at RVA: 0x"
-                    << std::hex << global.GlobalRVA << std::endl;
-                return;
-            }
-        }
-    }
-
-    std::cout << "[-] FNamePool not found" << std::endl;
-}
-
-void ScanForGUObjectArray(PEImage& Image, GlobalOffset& Result)
-{
-    std::cout << "\n[*] Scanning for GUObjectArray via string references..." << std::endl;
-
-    if (!Image.TextSection)
-    {
-        std::cout << "[-] No .text section found" << std::endl;
-        return;
-    }
-
-    for (const char* marker : TargetStrings::GUObjectArrayMarkers)
-    {
-        std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
-
-        // Step 1: Find string
-        StringLocation strLoc = FindStringInImage(Image, marker);
-        if (!strLoc.Found)
-        {
-            std::cout << "    [-] String not found" << std::endl;
-            continue;
-        }
-
-        std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
-
-        // Step 2: Find all xrefs (register-independent)
-        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
-            Image.TextSection->Data,
-            Image.TextSection->Size,
-            Image.TextSection->VirtualAddress,
-            strLoc.RVA);
-
-        if (xrefs.empty())
-        {
-            std::cout << "    [-] No xrefs found" << std::endl;
-            continue;
-        }
-
-        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s)" << std::endl;
-
-        // Step 3: Try each xref
-        for (const auto& xref : xrefs)
-        {
-            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA
-                << " (disp: 0x" << xref.Displacement << ")" << std::endl;
-
-            GlobalOffset global = FindGlobalNearXRef(
-                Image,
-                const_cast<XRefLocation&>(xref),
-                Image.TextSection->VirtualAddress,
-                marker);
-
-            if (global.Found)
-            {
-                Result = global;
-                Result.Marker = marker;
-                std::cout << "    [+] GUObjectArray found at RVA: 0x"
-                    << std::hex << global.GlobalRVA << std::endl;
-                return;
-            }
-        }
-    }
-
-    std::cout << "[-] GUObjectArray not found" << std::endl;
-}
-
-// ============================================================================
-// FILE LOADER
-// ============================================================================
-
-struct FileBuffer
-{
-    uint8_t* Data;
-    size_t   Size;
-
-    FileBuffer() : Data(nullptr), Size(0) {}
-
-    ~FileBuffer()
-    {
-        if (Data)
-        {
-            delete[] Data;
-            Data = nullptr;
-        }
-    }
-
-    bool Load(const char* FilePath)
-    {
-        std::ifstream file(FilePath, std::ios::binary | std::ios::ate);
-
-        if (!file.is_open())
-        {
-            std::cerr << "[!] Failed to open: " << FilePath << std::endl;
-            return false;
-        }
-
-        Size = static_cast<size_t>(file.tellg());
-        file.seekg(0, std::ios::beg);
-
-        Data = new uint8_t[Size];
-
-        if (!file.read(reinterpret_cast<char*>(Data), Size))
-        {
-            std::cerr << "[!] Failed to read file" << std::endl;
-            delete[] Data;
-            Data = nullptr;
-            Size = 0;
-            return false;
-        }
-
-        std::cout << "[+] Loaded " << Size << " bytes from: " << FilePath << std::endl;
+        outOffset = rva;
         return true;
     }
-};
+    return false;
+}
+
+std::string FourCC(uint32_t v)
+{
+    std::string s(4, ' ');
+    s[0] = static_cast<char>(v & 0xFF);
+    s[1] = static_cast<char>((v >> 8) & 0xFF);
+    s[2] = static_cast<char>((v >> 16) & 0xFF);
+    s[3] = static_cast<char>((v >> 24) & 0xFF);
+    return s;
+}
+
+// Section characteristics decoder — teaches what the flag bits mean.
+void PrintSectionCharacteristics(uint32_t ch)
+{
+    struct Flag { uint32_t bit; const char* name; };
+    static constexpr Flag flags[] = {
+        { 0x00000020, "CODE" },
+        { 0x00000040, "INITIALIZED_DATA" },
+        { 0x00000080, "UNINITIALIZED_DATA" },
+        { 0x02000000, "DISCARDABLE" },
+        { 0x04000000, "NOT_CACHED" },
+        { 0x08000000, "NOT_PAGED" },
+        { 0x10000000, "SHARED" },
+        { 0x20000000, "EXECUTE" },
+        { 0x40000000, "READ" },
+        { 0x80000000, "WRITE" },
+    };
+    bool first = true;
+    for (const auto& f : flags)
+    {
+        if (ch & f.bit)
+        {
+            std::cout << (first ? "" : "|") << f.name;
+            first = false;
+        }
+    }
+}
 
 // ============================================================================
-// MAIN ENTRY POINT
+//  MAIN — the parse itself
 // ============================================================================
 
 int main(int argc, char* argv[])
 {
-    std::cout << "========================================" << std::endl;
-    std::cout << "UE6 SDK Offset Extractor" << std::endl;
-    std::cout << "String-Reference Scanner (Register-Independent)" << std::endl;
-    std::cout << "========================================" << std::endl;
-
-    const char* targetFile = "FortniteClient-Win64-Shipping.exe";
-
-    if (argc > 1)
-        targetFile = argv[1];
-    else
+    if (argc != 2)
     {
-        std::cout << "\nUsage: " << argv[0] << " [path_to_exe]" << std::endl;
-        std::cout << "Using default: " << targetFile << std::endl;
-    }
-
-    std::cout << "\n[*] Loading executable..." << std::endl;
-
-    FileBuffer buffer;
-    if (!buffer.Load(targetFile))
-    {
-        std::cout << "\n[!] Ensure file is in current directory or pass full path" << std::endl;
-        std::cin.get();
+        std::cerr << "usage: " << (argc > 0 ? argv[0] : "pe_parser")
+                  << " <path-to-pe-file>\n";
         return 1;
     }
 
-    std::cout << "[+] File loaded" << std::endl;
-
-    // Parse PE
-    std::cout << "\n[*] Parsing PE image..." << std::endl;
-
-    PEImage image;
-    image.Base = buffer.Data;
-    image.Size = buffer.Size;
-    image.TextSection = nullptr;
-    image.DataSection = nullptr;
-    image.RDataSection = nullptr;
-
-    if (!ParsePEImage(buffer.Data, buffer.Size, image))
+    // --------------------------------------------------------------------
+    // Step 0: open the file and slurp it into memory.
+    // (A streaming parser could read field-by-field; slurping keeps the
+    //  example focused on the *format* rather than buffer management.)
+    // --------------------------------------------------------------------
+    std::ifstream file(argv[1], std::ios::binary);
+    if (!file)
     {
-        std::cerr << "[!] Failed to parse PE" << std::endl;
-        std::cin.get();
+        std::cerr << "error: cannot open \"" << argv[1] << "\"\n";
         return 1;
     }
 
-    std::cout << "[+] Image base: 0x" << std::hex << image.ImageBase << std::endl;
-    std::cout << "[+] Sections: " << std::dec << image.Sections.size() << std::endl;
-
-    if (image.TextSection)
-        std::cout << "    .text:  RVA=0x" << std::hex << image.TextSection->VirtualAddress
-        << ", Size=0x" << image.TextSection->Size << std::endl;
-    if (image.RDataSection)
-        std::cout << "    .rdata: RVA=0x" << std::hex << image.RDataSection->VirtualAddress
-        << ", Size=0x" << image.RDataSection->Size << std::endl;
-    if (image.DataSection)
-        std::cout << "    .data:  RVA=0x" << std::hex << image.DataSection->VirtualAddress
-        << ", Size=0x" << image.DataSection->Size << std::endl;
-
-    // Scan for offsets
-    GlobalOffset fNamePool, gUObjectArray;
-    ScanForFNamePool(image, fNamePool);
-    ScanForGUObjectArray(image, gUObjectArray);
-
-    // Print results
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "RESULTS" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-
-    if (fNamePool.Found)
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+    if (data.size() < sizeof(DosHeader))
     {
-        std::cout << "\n[FNamePool]" << std::endl;
-        std::cout << "  Marker: \"" << fNamePool.Marker << "\"" << std::endl;
-        std::cout << "  RVA: 0x" << std::hex << fNamePool.GlobalRVA << std::endl;
-        std::cout << "  VA:  0x" << std::hex << (image.ImageBase + fNamePool.GlobalRVA) << std::endl;
+        std::cerr << "error: file too small to contain a DOS header\n";
+        return 1;
     }
 
-    if (gUObjectArray.Found)
+    auto read_at = [&data](size_t off, void* dst, size_t n) -> bool
     {
-        std::cout << "\n[GUObjectArray]" << std::endl;
-        std::cout << "  Marker: \"" << gUObjectArray.Marker << "\"" << std::endl;
-        std::cout << "  RVA: 0x" << std::hex << gUObjectArray.GlobalRVA << std::endl;
-        std::cout << "  VA:  0x" << std::hex << (image.ImageBase + gUObjectArray.GlobalRVA) << std::endl;
+        if (off + n > data.size() || off + n < off)
+            return false;
+        std::memcpy(dst, data.data() + off, n);
+        return true;
+    };
+
+    std::cout << "==============================================================\n";
+    std::cout << " PE analysis: " << argv[1] << "\n";
+    std::cout << " file size  : " << data.size() << " bytes\n";
+    std::cout << "==============================================================\n";
+
+    // --------------------------------------------------------------------
+    // Step 1: DOS header — verify 'MZ' and find the way to the NT headers.
+    // --------------------------------------------------------------------
+    DosHeader dos{};
+    if (!read_at(0, &dos, sizeof(dos)))
+        return 1;
+
+    std::cout << "\n[DOS Header]\n";
+    if (dos.e_magic != 0x5A4D)
+    {
+        std::cerr << "error: not a PE file (e_magic is "
+                  << std::hex << dos.e_magic << ", expected 0x5A4D 'MZ')\n";
+        return 1;
+    }
+    std::cout << "  e_magic      = 0x5A4D ('MZ')\n";
+    std::cout << "  e_lfanew     = 0x" << std::hex << dos.e_lfanew
+              << "   <- file offset of NT headers\n";
+
+    // --------------------------------------------------------------------
+    // Step 2: NT signature — 'PE\0\0'.
+    // --------------------------------------------------------------------
+    const size_t ntOff = static_cast<size_t>(dos.e_lfanew);
+    uint32_t peSignature = 0;
+    if (ntOff + 4 > data.size() || !read_at(ntOff, &peSignature, 4))
+    {
+        std::cerr << "error: e_lfanew points outside the file\n";
+        return 1;
+    }
+    if (peSignature != 0x00004550)   // 'PE\0\0' little-endian
+    {
+        std::cerr << "error: bad NT signature (expected 'PE\\0\\0')\n";
+        return 1;
+    }
+    std::cout << "  signature    = 'PE\\0\\0'  (valid)\n";
+
+    // --------------------------------------------------------------------
+    // Step 3: file header — machine type, section count, timestamp.
+    // --------------------------------------------------------------------
+    FileHeader fh{};
+    if (!read_at(ntOff + 4, &fh, sizeof(fh)))
+        return 1;
+
+    std::cout << "\n[File Header]\n";
+    const char* machine = "unknown";
+    switch (fh.Machine)
+    {
+        case 0x014C: machine = "i386";              break;
+        case 0x8664: machine = "x64";               break;
+        case 0xAA64: machine = "ARM64";             break;
+        case 0x01C0: machine = "ARM Thumb-2";       break;
+    }
+    std::cout << "  Machine              = 0x" << std::hex << fh.Machine
+              << " (" << machine << ")\n";
+    std::cout << "  NumberOfSections     = " << std::dec << fh.NumberOfSections << "\n";
+    {
+        // TimeDateStamp is a plain unix timestamp in newer toolchains
+        const std::time_t ts = static_cast<std::time_t>(fh.TimeDateStamp);
+        const std::tm*    tm = std::gmtime(&ts);
+        char buf[32]{};
+        if (tm && std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", tm))
+            std::cout << "  TimeDateStamp        = 0x" << std::hex << fh.TimeDateStamp
+                      << "  (" << buf << ")\n";
+        else
+            std::cout << "  TimeDateStamp        = 0x" << std::hex << fh.TimeDateStamp << "\n";
+    }
+    std::cout << "  SizeOfOptionalHeader = 0x" << std::hex << fh.SizeOfOptionalHeader << "\n";
+    std::cout << "  Characteristics      = 0x" << std::hex << fh.Characteristics << "\n";
+
+    // --------------------------------------------------------------------
+    // Step 4: optional header — we only fully decode PE32+ (64-bit images).
+    // --------------------------------------------------------------------
+    const size_t optOff = ntOff + 4 + sizeof(FileHeader);
+    if (optOff + 2 > data.size())
+    {
+        std::cerr << "error: truncated optional header\n";
+        return 1;
     }
 
-    if (fNamePool.Found && gUObjectArray.Found)
+    uint16_t optMagic = 0;
+    std::memcpy(&optMagic, data.data() + optOff, 2);
+    if (optMagic != 0x20B)
     {
-        std::cout << "\n" << std::string(60, '-') << std::endl;
-        std::cout << "COPY-PASTE FOR YOUR CODE:" << std::endl;
-        std::cout << std::string(60, '-') << std::endl;
-        std::cout << "\nnamespace Offsets" << std::endl;
-        std::cout << "{" << std::endl;
-        std::cout << "    constexpr uintptr_t FNamePoolOffset   = 0x"
-            << std::hex << fNamePool.GlobalRVA << ";" << std::endl;
-        std::cout << "    constexpr uintptr_t GUObjectArrayOffset = 0x"
-            << std::hex << gUObjectArray.GlobalRVA << ";" << std::endl;
-        std::cout << "}" << std::endl;
+        std::cerr << "note: this image is PE32 (0x" << std::hex << optMagic
+                  << "); this tool demonstrates the PE32+ layout only.\n";
+        return 1;
     }
 
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "\n[*] Done. Press Enter to exit..." << std::endl;
-    std::cin.get();
+    OptionalHeaderPE32Plus opt{};
+    if (!read_at(optOff, &opt, sizeof(opt)))
+        return 1;
 
-    return (fNamePool.Found && gUObjectArray.Found) ? 0 : 1;
+    std::cout << "\n[Optional Header (PE32+)]\n";
+    std::cout << "  Magic                = 0x20B (PE32+)\n";
+    std::cout << "  LinkerVersion        = " << std::dec
+              << static_cast<int>(opt.MajorLinkerVersion) << "."
+              << static_cast<int>(opt.MinorLinkerVersion) << "\n";
+    std::cout << "  AddressOfEntryPoint  = 0x" << std::hex << opt.AddressOfEntryPoint << "  (RVA)\n";
+    std::cout << "  ImageBase            = 0x" << std::hex << opt.ImageBase << "\n";
+    std::cout << "  SectionAlignment     = 0x" << std::hex << opt.SectionAlignment << "\n";
+    std::cout << "  FileAlignment        = 0x" << std::hex << opt.FileAlignment << "\n";
+    std::cout << "  SizeOfImage          = 0x" << std::hex << opt.SizeOfImage << "\n";
+    std::cout << "  SizeOfHeaders        = 0x" << std::hex << opt.SizeOfHeaders << "\n";
+    std::cout << "  Subsystem            = " << std::dec << opt.Subsystem
+              << (opt.Subsystem == 2 ? "  (GUI)" :
+                  opt.Subsystem == 3 ? "  (console)" : "") << "\n";
+
+    // DllCharacteristics — where the binary "mitigation" flags live.
+    std::cout << "  DllCharacteristics   = 0x" << std::hex << opt.DllCharacteristics << "  [";
+    {
+        bool first = true;
+        auto flag = [&](uint16_t bit, const char* name)
+        {
+            if (opt.DllCharacteristics & bit)
+            {
+                std::cout << (first ? "" : ", ") << name;
+                first = false;
+            }
+        };
+        flag(0x0020, "HIGH_ENTROPY_VA");
+        flag(0x0040, "DYNAMIC_BASE (ASLR)");
+        flag(0x0100, "NX_COMPAT (DEP)");
+        flag(0x0400, "NO_SEH");
+        flag(0x8000, "TERMINAL_SERVER_AWARE");
+    }
+    std::cout << "]\n";
+
+    // --------------------------------------------------------------------
+    // Step 5: data directories — a table of RVAs to important structures.
+    // --------------------------------------------------------------------
+    const size_t ddOff = optOff + sizeof(OptionalHeaderPE32Plus);
+    const uint16_t ddCount = static_cast<uint16_t>(
+        (opt.NumberOfRvaAndSizes < 16) ? opt.NumberOfRvaAndSizes : 16);
+
+    struct DdName { const char* name; };
+    static constexpr DdName ddNames[16] = {
+        { "Export" },            { "Import" },
+        { "Resource" },          { "Exception" },
+        { "Security" },          { "BaseReloc" },
+        { "Debug" },             { "Architecture" },
+        { "GlobalPtr" },         { "TLS" },
+        { "LoadConfig" },        { "BoundImport" },
+        { "IAT" },               { "DelayImport" },
+        { "CLR Runtime" },       { "Reserved" },
+    };
+
+    std::cout << "\n[Data Directories]  (NumberOfRvaAndSizes = "
+              << std::dec << opt.NumberOfRvaAndSizes << ")\n";
+    std::vector<DataDirectory> dirs(ddCount);
+    for (uint16_t i = 0; i < ddCount; i++)
+    {
+        if (!read_at(ddOff + i * sizeof(DataDirectory), &dirs[i], sizeof(DataDirectory)))
+            break;
+        if (dirs[i].VirtualAddress == 0 && dirs[i].Size == 0)
+            continue;
+        std::cout << "  [" << std::dec << std::setw(2) << i << "] "
+                  << std::left << std::setw(14) << ddNames[i].name
+                  << std::right << " RVA=0x" << std::hex << dirs[i].VirtualAddress
+                  << "  Size=0x" << dirs[i].Size << "\n";
+    }
+
+    // --------------------------------------------------------------------
+    // Step 6: section table — 40-byte entries right after the optional header.
+    // --------------------------------------------------------------------
+    const size_t secOff = optOff + fh.SizeOfOptionalHeader;
+    std::vector<SectionHeader> sections(fh.NumberOfSections);
+
+    std::cout << "\n[Section Table]\n";
+    std::cout << "  #  name      VirtAddr  VirtSize  RawPtr    RawSize   flags\n";
+    for (uint16_t i = 0; i < fh.NumberOfSections; i++)
+    {
+        if (!read_at(secOff + i * sizeof(SectionHeader), &sections[i], sizeof(SectionHeader)))
+        {
+            std::cerr << "error: section table truncated\n";
+            return 1;
+        }
+        std::cout << "  " << std::dec << std::setw(2) << i << " "
+                  << std::left << std::setw(10)
+                  << std::string(sections[i].Name, strnlen(sections[i].Name, 8))
+                  << std::right << "0x" << std::hex << std::setfill('0') << std::setw(8)
+                  << sections[i].VirtualAddress << "  0x" << std::setw(8) << sections[i].VirtualSize
+                  << "  0x" << std::setw(8) << sections[i].PointerToRawData
+                  << "  0x" << std::setw(8) << sections[i].SizeOfRawData
+                  << std::setfill(' ') << "  ";
+        PrintSectionCharacteristics(sections[i].Characteristics);
+        std::cout << "\n";
+    }
+
+    // --------------------------------------------------------------------
+    // Step 7 (bonus): locate the import directory's first descriptor on disk,
+    // to show how RVAs map back to file offsets via the section table.
+    // --------------------------------------------------------------------
+    if (ddCount > 1 && dirs[1].VirtualAddress != 0)
+    {
+        uint32_t importFileOff = 0;
+        std::cout << "\n[Import Directory Demo]\n";
+        if (RvaToFileOffset(dirs[1].VirtualAddress, sections, importFileOff))
+        {
+            std::cout << "  Import dir RVA 0x" << std::hex << dirs[1].VirtualAddress
+                      << " -> file offset 0x" << importFileOff << "\n";
+        }
+        else
+        {
+            std::cout << "  (could not map import RVA to a file offset)\n";
+        }
+    }
+
+    std::cout << "\n==============================================================\n";
+    std::cout << " parse complete\n";
+    std::cout << "==============================================================\n";
+    return 0;
 }
+Quick orientation to the three pieces you asked for:
+
+Packed structs (lines ~30–120): each one is followed by a static_assert pinning its size to the PE spec value (64/20/112/40 bytes), so any accidental padding or field-width mistake fails at compile time rather than silently corrupting the parse. DataDirectory is the one struct without an assert only because it's a trivial 8-byte pair.
+RvaToFileOffset: the translation works by walking the section table to find which section's virtual range (VirtualAddress .. VirtualAddress + VirtualSize) contains the RVA, then applying the same delta to the section's disk location (PointerToRawData). The two guard cases matter in practice: uninitialized sections (BSS-style, SizeOfRawData == 0) have no bytes on disk, and the header region before the first section is identity-mapped (RVA == file offset).
+main(): takes exactly one argument, reads the whole file into a std::vector<uint8_t> via std::ifstream + istreambuf_iterator, then uses one bounds-checked read_at lambda for every struct read — that's the whole safety story. The parse order is the chain I described earlier: MZ → e_lfanew → PE\0\0 → file header → optional header → data directories → section table, with the import-directory demo at the end exercising the RVA→offset conversion for real.
+Build it standalone with cl /std:c++17 /EHsc pe_parser.cpp or use the pe_parser.vcxproj already in that folder. Try it on a few different binaries — a system DLL, one of your own builds — and watch how e_lfanew varies, how ImageBase differs between EXEs (0x140000000) and DLLs (0x180000000), and which data directories each image populates. That variation is the fastest way to internalize what's fixed by the spec versus chosen by the linker.
