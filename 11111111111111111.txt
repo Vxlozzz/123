@@ -277,6 +277,55 @@ std::vector<XRefLocation> FindAllXRefsToRVA(
 )
 {
     std::vector<XRefLocation> results;
+
+    if (!CodeSection || CodeSize < 4)
+        return results;
+
+    // Scan every byte position as potential displacement location
+    for (size_t i = 0; i <= CodeSize - 4; i++)
+    {
+        // Read 4 bytes as potential signed RIP-relative displacement
+        int32_t disp = *reinterpret_cast<int32_t*>(CodeSection + i);
+
+        // Try different instruction sizes (5, 6, 7 bytes are common for RIP-relative)
+        for (uint8_t instSize = 5; instSize <= 7; instSize++)
+        {
+            // Calculate instruction's starting address
+            // Displacement is at position i within the instruction
+            // For instSize bytes total with 4-byte displacement at the end:
+            //   instStart = i - (instSize - 4)
+            int32_t instStart = static_cast<int32_t>(i) - (instSize - 4);
+
+            if (instStart < 0)
+                continue;
+
+            // Calculate instruction RVA from code section base
+            uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(instStart);
+
+            // Calculate target address using RIP-relative formula:
+            // RIP points to the next instruction (instruction end)
+            // Target = InstructionEnd + Displacement
+            // Target = (instRVA + instSize) + disp
+            int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
+
+            if (potentialTarget == static_cast<int64_t>(TargetRVA))
+            {
+                XRefLocation xref;
+                xref.FileOffset = static_cast<uint32_t>(instStart);
+                xref.RVA = instRVA;
+                xref.Displacement = disp;
+                xref.InstructionSize = instSize;
+                xref.Found = true;
+                results.push_back(xref);
+            }
+        }
+    }
+
+    return results;
+}
+
+{
+    std::vector<XRefLocation> results;
     
     if (!CodeSection || CodeSize < 4)
         return results;
