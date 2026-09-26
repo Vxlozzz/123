@@ -1,3 +1,934 @@
+#pragma once
+#include <cstdint>
+#include <string>
+#include <windows.h>
+
+// ============================================================================
+// CONFIGURATION - Plug your IDA offsets here
+// ============================================================================
+namespace Offsets
+{
+    constexpr uintptr_t FNamePoolOffset   = 0x0; // <- Set in IDA
+    constexpr uintptr_t GUObjectArrayOffset = 0x0; // <- Set in IDA
+}
+
+// ============================================================================
+// FNAMEPOOL STRUCTURES - UE5/6 Chunked String Storage
+// ============================================================================
+
+/*
+FNamePool layout (UE5+):
+- Strings are stored in chunks for cache efficiency
+- Each chunk is 64KB, entries are variable length
+- Name index is split into [chunk index][entry offset within chunk]
+- Chunk index: bits 0-15 (max 65536 chunks, ~4GB total string data)
+- Entry offset: derived from index & 0xFFFF + chunk base pointer
+*/
+
+struct FNameEntry
+{
+    // Header: lower 4 bits hold info flags (wide, length, etc)
+    // Upper bits store hash and length
+    uint32_t Header;
+    
+    // Variable-length string data follows immediately after header
+    union
+    {
+        char    AnsiName[1];
+        wchar_t WideName[1];
+    };
+
+    // Check if this entry uses wide characters
+    inline bool IsWide() const
+    {
+        return (Header & 0x1) != 0;
+    }
+
+    // Extract string length from header (upper bits)
+    // UE6 layout: [hash bits][length bits:10][flags:6]
+    inline int32_t GetLength() const
+    {
+        return (Header >> 6) & 0x3FF; // 10 bits for length (max 1023 chars)
+    }
+
+    // Retrieve the actual string (converts wide to ansi if needed)
+    std::string GetString() const;
+};
+
+// Chunk allocator for FNamePool entries
+// Each chunk holds variable-length FNameEntry structures
+struct FNamePoolChunk
+{
+    uint8_t* Data; // Pointer to chunk memory block
+};
+
+// Main FNamePool structure - handles string storage and lookup
+struct FNamePool
+{
+    // Critical section for thread safety
+    CRITICAL_SECTION CriticalSection;
+    
+    // Current chunk being written to
+    int32_t CurrentChunk;
+    
+    // Byte offset within current chunk for next allocation
+    int32_t CurrentByte;
+    
+    // Array of chunk pointers (each 64KB block)
+    // Max 0x10000 chunks (index mask 0xFFFF)
+    FNamePoolChunk Chunks[0x10000];
+
+    // Resolve an FName index to its string
+    // Index format: [chunk_index:16][entry_offset_in_chunk:remaining bits]
+    std::string ResolveName(uint32_t NameIndex) const;
+};
+
+// ============================================================================
+// GUOBJECTARRAY STRUCTURES - Global UObject Storage
+// ============================================================================
+
+/*
+FUObjectItem layout:
+- Wraps UObject pointer with additional tracking data
+- Flags: ownership, garbage collection, async load state
+- UObject pointer is first member for easy casting
+*/
+
+struct FUObjectItem
+{
+    class UObject* Object;         // Pointer to the actual UObject
+    int32_t        Flags;          // Object flags (owned, garbage, etc)
+    int32_t        ClusterIndex;   // For garbage collection clustering
+    int32_t        SerialNumber;   // Unique serial for tracking
+};
+
+/*
+TUObjectArray layout (UE5+):
+- Objects stored in multiple chunks for memory efficiency
+- Similar to FNamePool but for UObject pointers
+- Each element is an FUObjectItem (16 bytes typically)
+*/
+
+struct TUObjectArray
+{
+    /*
+    UE5/6 TUObjectArray Layout:
+    - Objects: Array of chunk pointers (FUObjectItem**)
+    - Each chunk is exactly 64KB (0x10000 bytes)
+    - Elements per chunk = 0x10000 / sizeof(FUObjectItem)
+    - With 24-byte FUObjectItem: 2730 items per chunk
+    - With 16-byte FUObjectItem: 4096 items per chunk
+    
+    Chunk calculation:
+    - ChunkIndex = Index / ElementsPerChunk
+    - OffsetInChunk = Index % ElementsPerChunk
+    */
+    
+    FUObjectItem** Objects;        // Array of chunk pointers
+    int32_t        MaxElements;    // Total allocated capacity
+    int32_t        NumElements;    // Current object count
+    int32_t        MaxChunks;      // Maximum chunks allocated
+    int32_t        NumChunks;      // Current chunk count
+    
+    // Size of each chunk in bytes (always 0x10000 = 65536)
+    static constexpr int32_t ChunkSize = 0x10000;
+    
+    // Elements per chunk (calculated at runtime based on FUObjectItem size)
+    static constexpr int32_t ElementsPerChunk = ChunkSize / sizeof(FUObjectItem);
+
+    // Access object by index with chunk calculation
+    FUObjectItem* GetObjectByIndex(int32_t Index) const;
+    
+    // Iterate all active UObjects
+    void ForEachObject(void(*Callback)(UObject*, void*), void* UserData) const;
+    
+    // Get total chunk count
+    int32_t GetNumChunks() const { return NumChunks; }
+    
+    // Get chunk pointer by index
+    FUObjectItem* GetChunk(int32_t ChunkIndex) const;
+};
+
+// Base UObject class (minimal definition for iteration purposes)
+class UObject
+{
+public:
+    void*        VTable;           // Virtual function table
+    int32_t      Index;            // Index into GUObjectArray
+    class UClass* Class;           // Object's class type
+    FName        Name;             // Object name (index into FNamePool)
+    int32_t      OuterIndex;       // Outer object (owner)
+
+    // Get object name as string
+    std::string GetName() const;
+    
+    // Get class name as string
+    std::string GetClassName() const;
+};
+
+// FName structure - lightweight name reference
+struct FName
+{
+    uint32_t Index;                // Index into FNamePool
+    uint32_t Number;               // Instance number (for duplicates)
+
+    std::string ToString() const;
+};
+
+// ============================================================================
+// GLOBAL ACCESSORS
+// ============================================================================
+
+inline FNamePool* GetFNamePool()
+{
+    return reinterpret_cast<FNamePool*>(
+        (uintptr_t)GetModuleHandle(nullptr) + Offsets::FNamePoolOffset
+    );
+}
+
+inline TUObjectArray* GetGUObjectArray()
+{
+    return reinterpret_cast<TUObjectArray*>(
+        (uintptr_t)GetModuleHandle(nullptr) + Offsets::GUObjectArrayOffset
+    );
+}
+
+#include "UE_SDK_Core.h"
+
+// ============================================================================
+// FNAMEPOOL IMPLEMENTATION
+// ============================================================================
+
+/*
+UE6 Chunk math explanation:
+- FName index is a 32-bit value
+- Bits [0:15]  = entry offset (shifted left by 2 for 4-byte alignment)
+- Bits [16:31] = chunk index (which 64KB block)
+- Each chunk is 64KB = 0x10000 bytes
+- Entry offset must be multiplied by 4 (sizeof pointer alignment)
+
+Example: NameIndex = 0xABCD0002
+- Chunk index = 0xABCD (upper 16 bits, >> 16)
+- Entry offset = 0x0002 * 4 = 8 bytes from chunk start
+- Final address = Chunks[0xABCD]->Data + 8
+*/
+
+std::string FNameEntry::GetString() const
+{
+    std::string result;
+    int32_t length = GetLength();
+    
+    if (length <= 0)
+        return result;
+    
+    result.reserve(length);
+    
+    if (IsWide())
+    {
+        // Convert wide to ANSI (narrow conversion)
+        for (int32_t i = 0; i < length && WideName[i] != 0; i++)
+        {
+            result += static_cast<char>(WideName[i]);
+        }
+    }
+    else
+    {
+        // Direct copy from ANSI buffer
+        result.assign(AnsiName, length);
+    }
+    
+    return result;
+}
+
+std::string FNamePool::ResolveName(uint32_t NameIndex) const
+{
+    // UE6: Extract chunk index from upper 16 bits
+    uint32_t chunkIndex = NameIndex >> 16;
+    
+    // UE6: Extract entry offset from lower 16 bits, multiply by 4 for alignment
+    uint32_t entryOffset = (NameIndex & 0xFFFF) * 4;
+    
+    // Bounds check
+    if (chunkIndex >= 0x10000)
+        return "";
+    
+    // Get chunk base pointer
+    const FNamePoolChunk& chunk = Chunks[chunkIndex];
+    if (!chunk.Data)
+        return "";
+    
+    // Calculate entry pointer
+    const FNameEntry* entry = reinterpret_cast<const FNameEntry*>(
+        chunk.Data + entryOffset
+    );
+    
+    return entry->GetString();
+}
+
+// ============================================================================
+// GUOBJECTARRAY IMPLEMENTATION
+// ============================================================================
+
+/*
+TUObjectArray chunk-based access (UE5/6):
+
+Chunk Layout:
+- Each chunk is exactly 65,536 bytes (0x10000)
+- Elements per chunk = 0x10000 / sizeof(FUObjectItem)
+- For 16-byte items: 4096 elements per chunk
+- For 24-byte items: 2730 elements per chunk
+- For 32-byte items: 2048 elements per chunk
+
+Address Calculation:
+- ChunkIndex = Index / ElementsPerChunk
+- OffsetInChunk = Index % ElementsPerChunk
+- Address = Objects[ChunkIndex][OffsetInChunk]
+*/
+
+FUObjectItem* TUObjectArray::GetChunk(int32_t ChunkIndex) const
+{
+    if (!Objects || ChunkIndex < 0 || ChunkIndex >= NumChunks)
+        return nullptr;
+    
+    return Objects[ChunkIndex];
+}
+
+FUObjectItem* TUObjectArray::GetObjectByIndex(int32_t Index) const
+{
+    // Bounds check
+    if (Index < 0 || Index >= NumElements)
+        return nullptr;
+    
+    if (!Objects)
+        return nullptr;
+    
+    // Calculate which chunk contains this index
+    int32_t chunkIndex = Index / ElementsPerChunk;
+    int32_t offsetInChunk = Index % ElementsPerChunk;
+    
+    // Verify chunk exists
+    if (chunkIndex >= NumChunks)
+        return nullptr;
+    
+    // Get the chunk pointer
+    FUObjectItem* chunk = Objects[chunkIndex];
+    if (!chunk)
+        return nullptr;
+    
+    // Return pointer to the specific item within the chunk
+    return &chunk[offsetInChunk];
+}
+
+void TUObjectArray::ForEachObject(
+    void(*Callback)(UObject*, void*),
+    void* UserData
+) const
+{
+    if (!Callback || !Objects || NumElements <= 0)
+        return;
+    
+    // Iterate all registered objects
+    for (int32_t i = 0; i < NumElements; i++)
+    {
+        FUObjectItem* item = GetObjectByIndex(i);
+        
+        // Skip invalid slots (freed or null objects)
+        if (!item || !item->Object)
+            continue;
+        
+        // Invoke callback with object and user data
+        Callback(item->Object, UserData);
+    }
+}
+
+// Alternative: Chunk-by-chunk iteration (more efficient for large arrays)
+void TUObjectArray::ForEachObjectByChunk(
+    void(*Callback)(UObject*, void*),
+    void* UserData
+) const
+{
+    if (!Callback || !Objects || NumElements <= 0)
+        return;
+    
+    int32_t processedCount = 0;
+    
+    for (int32_t chunkIdx = 0; chunkIdx < NumChunks && processedCount < NumElements; chunkIdx++)
+    {
+        FUObjectItem* chunk = Objects[chunkIdx];
+        if (!chunk)
+            continue;
+        
+        // Iterate through elements in this chunk
+        int32_t startIdx = chunkIdx * ElementsPerChunk;
+        int32_t endIdx = (chunkIdx + 1) * ElementsPerChunk;
+        
+        // Clamp to actual element count
+        if (endIdx > NumElements)
+            endIdx = NumElements;
+        
+        for (int32_t i = startIdx; i < endIdx; i++)
+        {
+            int32_t offsetInChunk = i % ElementsPerChunk;
+            FUObjectItem* item = &chunk[offsetInChunk];
+            
+            if (item && item->Object)
+            {
+                Callback(item->Object, UserData);
+                processedCount++;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// UOBJECT HELPERS
+// ============================================================================
+
+std::string FName::ToString() const
+{
+    FNamePool* pool = GetFNamePool();
+    if (!pool)
+        return "";
+    
+    std::string baseName = pool->ResolveName(Index);
+    
+    // Append instance number if > 0 (for duplicate names like "Widget_2")
+    if (Number > 0)
+    {
+        baseName += "_" + std::to_string(Number);
+    }
+    
+    return baseName;
+}
+
+std::string UObject::GetName() const
+{
+    return Name.ToString();
+}
+
+std::string UObject::GetClassName() const
+{
+    if (!Class)
+        return "None";
+    
+    return Class->Name.ToString();
+}
+
+// ============================================================================
+// EXAMPLE USAGE / DUMPING
+// ============================================================================
+
+#include <iostream>
+#include <fstream>
+
+void DumpAllUObjects()
+{
+    TUObjectArray* objArray = GetGUObjectArray();
+    if (!objArray)
+    {
+        std::cerr << "[!] GUObjectArray not found" << std::endl;
+        return;
+    }
+    
+    std::cout << "[*] Total objects: " << objArray->NumElements << std::endl;
+    
+    int32_t count = 0;
+    for (int32_t i = 0; i < objArray->NumElements; i++)
+    {
+        FUObjectItem* item = objArray->GetObjectByIndex(i);
+        if (!item || !item->Object)
+            continue;
+        
+        UObject* obj = item->Object;
+        std::string name = obj->GetName();
+        std::string className = obj->GetClassName();
+        
+        std::cout << "[" << i << "] " << className << " " << name << std::endl;
+        count++;
+    }
+    
+    std::cout << "[*] Dumped " << count << " active objects" << std::endl;
+}
+
+// Entry point for testing
+int main()
+{
+    std::cout << "UE5/6 SDK Dumper - Core Structures" << std::endl;
+    std::cout << "==================================" << std::endl;
+    std::cout << "FNamePool offset: 0x" << std::hex << Offsets::FNamePoolOffset << std::endl;
+    std::cout << "GUObjectArray offset: 0x" << std::hex << Offsets::GUObjectArrayOffset << std::endl;
+    std::cout << std::endl;
+    
+    DumpAllUObjects();
+    
+    std::cin.get();
+    return 0;
+}
+
+#pragma once
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <windows.h>
+#include <psapi.h>
+
+// ============================================================================
+// SIGNATURE DEFINITIONS - UE5/6 FNamePool & GUObjectArray
+// ============================================================================
+
+namespace Signatures
+{
+    /*
+    FNamePool Signature (UE5.1+ / UE6):
+    
+    Target: String reference "%d ansi FNames" used in FNamePool initialization
+    Context: FNamePool::DumpStats() or constructor loads this string address
+        
+    Pattern: lea rcx, [rip + offset_to_string]
+             call printf
+    
+    The LEA instruction loads the string address relative to RIP.
+    We find the LEA, extract the relative offset, and resolve the string address.
+    Then FNamePool is typically a few instructions before this (static global).
+    
+    Alternative pattern targets FNamePool directly via its chunk initialization.
+    */
+    constexpr const char* FNamePool = 
+        "74 09 48 8D 15 ? ? ? ? ";  // LEA RDX, [rip + offset] before string ref
+    
+    // Extended pattern for FNamePool static address
+    // Targets: Initialize function that sets up FNamePool chunks
+    constexpr const char* FNamePoolAlt = 
+        "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ? ";  // LEA RCX, [FNamePool]
+    
+    /*
+    GUObjectArray Signature (UE5.1+ / UE6):
+    
+    Target: FUObjectArray::AllocateObjectPool() function
+    Context: Allocates the chunk array and stores pointer to GUObjectArray global
+    
+    Pattern: lea rcx, [GUObjectArray]  ; load global address
+             call allocation_function
+    
+    The LEA instruction's RIP-relative offset points to GUObjectArray global.
+    */
+    constexpr const char* GUObjectArray = 
+        "48 8B 05 ? ? ? ? 48 85 C0 75 ? ";  // MOV RAX, [GUObjectArray]
+    
+    // Alternative: Direct LEA to GUObjectArray
+    constexpr const char* GUObjectArrayAlt = 
+        "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D";
+    
+    /*
+    GNames (older UE4/early UE5 compatibility - FNamePool predecessor):
+    
+    For backwards compatibility, some UE5 builds still reference GNames.
+    */
+    constexpr const char* GNames = 
+        "48 89 05 ? ? ? ? 48 89 0D";
+}
+
+// ============================================================================
+// PATTERN SCANNER
+// ============================================================================
+
+namespace PatternScanner
+{
+    struct PatternByte
+    {
+        uint8_t Value;
+        bool    IsWildcard;
+    };
+
+    // Convert signature string "48 8D ? ? 5A" to pattern bytes
+    inline std::vector<PatternByte> ParsePattern(const char* Pattern)
+    {
+        std::vector<PatternByte> result;
+        std::string patternStr(Pattern);
+        
+        size_t pos = 0;
+        while (pos < patternStr.length())
+        {
+            // Skip whitespace
+            while (pos < patternStr.length() && patternStr[pos] == ' ')
+                pos++;
+            
+            if (pos >= patternStr.length())
+                break;
+            
+            PatternByte byte = { 0, false };
+            
+            // Check for wildcard
+            if (patternStr[pos] == '?')
+            {
+                byte.IsWildcard = true;
+                byte.Value = 0;
+                pos++;
+            }
+            else
+            {
+                // Parse hex byte
+                char hex[3] = { patternStr[pos], patternStr[pos + 1], 0 };
+                byte.Value = static_cast<uint8_t>(std::stoi(hex, nullptr, 16));
+                byte.IsWildcard = false;
+                pos += 2;
+            }
+            
+            result.push_back(byte);
+        }
+        
+        return result;
+    }
+
+    /*
+    FindPattern: Scans memory buffer for signature match
+    
+    Parameters:
+        StartAddress  - Base address to begin scan
+        Size          - Size of memory region to scan
+        Pattern       - Signature string with '?' wildcards (e.g., "48 8D 0D ? ? ? ?")
+    
+    Returns:
+        Address of first match, or nullptr if not found
+    */
+    inline uint8_t* FindPattern(
+        uint8_t*    StartAddress,
+        size_t      Size,
+        const char* Pattern
+    )
+    {
+        std::vector<PatternByte> pattern = ParsePattern(Pattern);
+        
+        if (pattern.empty())
+            return nullptr;
+        
+        size_t patternLength = pattern.size();
+        
+        // Scan through memory
+        for (size_t i = 0; i <= Size - patternLength; i++)
+        {
+            bool found = true;
+            
+            for (size_t j = 0; j < patternLength; j++)
+            {
+                if (!pattern[j].IsWildcard && 
+                    StartAddress[i + j] != pattern[j].Value)
+                {
+                    found = false;
+                    break;
+                }
+            }
+            
+            if (found)
+                return &StartAddress[i];
+        }
+        
+        return nullptr;
+    }
+
+    /*
+    FindPatternEx: Scans module memory for signature
+    
+    Parameters:
+        ModuleBase    - Base address of module (e.g., GetModuleHandle)
+        ModuleSize    - Size of module (optional, auto-detect if 0)
+        Pattern       - Signature string with '?' wildcards
+    
+    Returns:
+        Address of first match, or nullptr if not found
+    */
+    inline uint8_t* FindPatternEx(
+        HMODULE     ModuleBase,
+        const char* Pattern,
+        size_t      ModuleSize = 0
+    )
+    {
+        uint8_t* base = reinterpret_cast<uint8_t*>(ModuleBase);
+        size_t size = ModuleSize;
+        
+        // Auto-detect module size if not provided
+        if (size == 0)
+        {
+            MODULEINFO modInfo;
+            if (!GetModuleInformation(GetCurrentProcess(), ModuleBase, &modInfo, sizeof(modInfo)))
+                return nullptr;
+            size = modInfo.SizeOfImage;
+        }
+        
+        return FindPattern(base, size, Pattern);
+    }
+
+    /*
+    ResolveRelativeAddress: Extracts address from RIP-relative instruction
+    
+    Parameters:
+        Address      - Address of instruction containing relative offset
+        Offset       - Offset from instruction start to the relative displacement
+        InstructionSize - Total size of the instruction (default 7 for LEA/MOV)
+    
+    Returns:
+        Absolute address pointed to by the instruction
+    
+    Example:
+        Address points to "48 8D 0D [XX XX XX XX]"
+        Offset = 3 (position of displacement)
+        InstructionSize = 7
+        Returns: Address + 7 + displacement
+    */
+    inline uint8_t* ResolveRelativeAddress(
+        uint8_t* Address,
+        int32_t  Offset,
+        int32_t  InstructionSize = 7
+    )
+    {
+        // Read the 32-bit relative displacement
+        int32_t relativeOffset = *reinterpret_cast<int32_t*>(Address + Offset);
+        
+        // RIP points to next instruction, so: next_instruction + displacement
+        return Address + InstructionSize + relativeOffset;
+    }
+}
+
+// ============================================================================
+// SCANNER USAGE EXAMPLE
+// ============================================================================
+
+/*
+Example: Finding FNamePool and GUObjectArray in FortniteClient
+
+// 1. Find FNamePool
+uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(
+    GetModuleHandle(nullptr),
+    Signatures::FNamePoolAlt
+);
+
+if (fnPoolPattern)
+{
+    // Pattern: 48 8D 0D [XX XX XX XX] E8 ...
+    // Offset 3 contains the relative displacement to FNamePool
+    FNamePool* fnPool = reinterpret_cast<FNamePool*>(
+        PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7)
+    );
+}
+
+// 2. Find GUObjectArray
+uint8_t* objArrayPattern = PatternScanner::FindPatternEx(
+    GetModuleHandle(nullptr),
+    Signatures::GUObjectArray
+);
+
+if (objArrayPattern)
+{
+    // Pattern: 48 8B 05 [XX XX XX XX] 48 85 C0 ...
+    // Offset 3 contains the relative displacement to GUObjectArray
+    TUObjectArray* objArray = reinterpret_cast<TUObjectArray*>(
+        PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7)
+    );
+}
+*/
+
+#include "PatternScanner.h"
+#include <iostream>
+
+// ============================================================================
+// SIGNATURE SCANNER - INTEGRATION EXAMPLE
+// ============================================================================
+
+/*
+Signature Pattern Explanations:
+
+1. FNamePool Signatures
+   
+   Primary: "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ?"
+   - Target: FNamePool initialization code
+   - Instruction: LEA RCX, [rip + offset_to_FNamePool]
+   - The LEA loads the address of the global FNamePool static variable
+   - We extract the RIP-relative offset at position 3
+   
+   Alternative: "74 09 48 8D 15 ? ? ? ?"
+   - Target: String reference "%d ansi FNames"
+   - Instruction: LEA RDX, [rip + offset_to_string]
+   - Found near FNamePool::DumpStats()
+   - Used when FNamePool global pattern fails
+   
+   String Reference Context:
+   - "%d ansi FNames" is a debug string in FNamePool initialization
+   - FNamePool constructor or DumpStats() loads this for logging
+   - Finding this string means FNamePool is nearby in code
+   - From the string reference, scan backwards for FNamePool global access
+
+2. GUObjectArray Signatures
+   
+   Primary: "48 8B 05 ? ? ? ? 48 85 C0 75 ?"
+   - Target: FUObjectArray::AllocateObjectPool() or GUObjectArray access
+   - Instruction: MOV RAX, [rip + offset_to_GUObjectArray]
+   - Loads the global UObject array pointer
+   - The test and jnz follow: "48 85 C0" (TEST RAX, RAX), "75 ?" (JNZ)
+   - Offset 3 contains the relative displacement
+   
+   Alternative: "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D"
+   - Target: GUObjectArray initialization
+   - Instruction: LEA RCX, [rip + offset_to_GUObjectArray]
+   - Found in object array setup code
+   - Followed by call (E8) and compare (83 3D)
+
+3. Pattern Scanning Methodology
+   
+   RIP-Relative Addressing:
+   - x64 instructions reference globals via RIP-relative offsets
+   - Format: [instruction opcode] [32-bit signed displacement]
+   - Absolute address = instruction_address + instruction_size + displacement
+   - This allows ASLR-safe code (offsets stay constant regardless of base)
+   
+   Wildcards ('?'):
+   - Match any byte value
+   - Used for addresses that change per-build
+   - Also for offsets that vary between compiler runs
+   
+   Instruction Sizes:
+   - LEA reg, [rip + offset] = 7 bytes (48 8D 0D XX XX XX XX)
+   - MOV reg, [rip + offset] = 7 bytes (48 8B 05 XX XX XX XX)
+   - Always verify instruction size when resolving addresses
+
+4. Fortnite-Specific Notes
+   
+   Shipping Build Optimizations:
+   - Functions may be inlined, changing expected patterns
+   - Keep multiple signature variants for fallback
+   - Always verify found address points to valid memory
+   
+   Anti-Cheat Considerations:
+   - External scanner should read process memory remotely
+   - Don't write to game memory during scanning
+   - Pattern scan at startup before anti-cheat fully initializes
+*/
+
+// ============================================================================
+// HELPER: AUTO-OFFSET FINDER
+// ============================================================================
+
+struct FoundOffsets
+{
+    uintptr_t FNamePool;
+    uintptr_t GUObjectArray;
+    bool      Success;
+};
+
+inline FoundOffsets FindUE6Offsets()
+{
+    FoundOffsets result = { 0, 0, false };
+    
+    HMODULE hModule = GetModuleHandle(nullptr);
+    if (!hModule)
+    {
+        std::cerr << "[!] Failed to get module handle" << std::endl;
+        return result;
+    }
+    
+    // Get module base and size
+    MODULEINFO modInfo;
+    if (!GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo)))
+    {
+        std::cerr << "[!] Failed to get module info" << std::endl;
+        return result;
+    }
+    
+    uint8_t* moduleBase = reinterpret_cast<uint8_t*>(hModule);
+    size_t moduleSize = modInfo.SizeOfImage;
+    
+    std::cout << "[*] Module base: 0x" << std::hex << (uintptr_t)moduleBase << std::endl;
+    std::cout << "[*] Module size: 0x" << std::hex << moduleSize << std::endl;
+    
+    // Find FNamePool
+    std::cout << "\n[*] Scanning for FNamePool..." << std::endl;
+    
+    uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePoolAlt, moduleSize);
+    
+    if (!fnPoolPattern)
+    {
+        std::cout << "[!] Primary FNamePool pattern failed, trying alternate..." << std::endl;
+        fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePool, moduleSize);
+    }
+    
+    if (fnPoolPattern)
+    {
+        // Resolve RIP-relative address
+        // Pattern: 48 8D 0D [XX XX XX XX] ...
+        // Offset 3 = position of 32-bit displacement
+        uint8_t* fnPoolAddress = PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7);
+        
+        result.FNamePool = reinterpret_cast<uintptr_t>(fnPoolAddress) - reinterpret_cast<uintptr_t>(moduleBase);
+        
+        std::cout << "[+] FNamePool found at offset: 0x" << std::hex << result.FNamePool << std::endl;
+        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)fnPoolPattern << std::endl;
+        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)fnPoolAddress << std::endl;
+    }
+    else
+    {
+        std::cerr << "[-] FNamePool signature not found" << std::endl;
+    }
+    
+    // Find GUObjectArray
+    std::cout << "\n[*] Scanning for GUObjectArray..." << std::endl;
+    
+    uint8_t* objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArray, moduleSize);
+    
+    if (!objArrayPattern)
+    {
+        std::cout << "[!] Primary GUObjectArray pattern failed, trying alternate..." << std::endl;
+        objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArrayAlt, moduleSize);
+    }
+    
+    if (objArrayPattern)
+    {
+        // Resolve RIP-relative address
+        // Pattern: 48 8B 05 [XX XX XX XX] ...
+        // Offset 3 = position of 32-bit displacement
+        uint8_t* objArrayAddress = PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7);
+        
+        result.GUObjectArray = reinterpret_cast<uintptr_t>(objArrayAddress) - reinterpret_cast<uintptr_t>(moduleBase);
+        
+        std::cout << "[+] GUObjectArray found at offset: 0x" << std::hex << result.GUObjectArray << std::endl;
+        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)objArrayPattern << std::endl;
+        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)objArrayAddress << std::endl;
+    }
+    else
+    {
+        std::cerr << "[-] GUObjectArray signature not found" << std::endl;
+    }
+    
+    result.Success = (result.FNamePool != 0 && result.GUObjectArray != 0);
+    
+    if (result.Success)
+    {
+        std::cout << "\n[+] All offsets found successfully!" << std::endl;
+        std::cout << "\n// Paste into Offsets namespace:" << std::endl;
+        std::cout << "constexpr uintptr_t FNamePoolOffset   = 0x" << std::hex << result.FNamePool << ";" << std::endl;
+        std::cout << "constexpr uintptr_t GUObjectArrayOffset = 0x" << std::hex << result.GUObjectArray << ";" << std::endl;
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// ENTRY POINT FOR TESTING
+// ============================================================================
+
+int main()
+{
+    std::cout << "========================================" << std::endl;
+    std::cout << "UE6 Pattern Scanner - Offset Finder" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+    
+    FoundOffsets offsets = FindUE6Offsets();
+    
+    std::cout << "\nPress Enter to exit..." << std::endl;
+    std::cin.get();
+    
+    return offsets.Success ? 0 : 1;
+}
+
 #include <cstdint>
 #include <iostream>
 #include <fstream>
@@ -17,6 +948,8 @@ namespace TargetStrings
         "bIsPureAnsi",         // FNameEntry property check
         "FNamePool",           // Debug/assert messages
         "Invalid FName",       // Error handling code
+        "Unable to find",      // FName lookup error
+        "FName ",              // FName prefix in logs
     };
     
     // GUObjectArray string references (stable across UE versions)
@@ -26,6 +959,8 @@ namespace TargetStrings
         "LoadTimeFileForCommandlet",        // Object loading code
         "GUObjectArray",                    // Direct reference in debug builds
         "ObjObjects",                       // Alternative global name
+        "MaxObjects",                       // GC limit variable
+        "Object count",                     // Debug output
     };
 }
 
@@ -311,7 +1246,7 @@ StringLocation FindStringInImage(
 }
 
 // ============================================================================
-// XREF FINDER - LOCATE INSTRUCTION REFERENCING STRING ADDRESS
+// XREF FINDER - REGISTER-AGNOSTIC STRING REFERENCE LOCATOR
 // ============================================================================
 
 struct XRefLocation
@@ -319,95 +1254,157 @@ struct XRefLocation
     uint32_t FileOffset;        // Instruction location in file
     uint32_t RVA;               // Instruction RVA
     int32_t  Displacement;      // RIP-relative displacement in instruction
-    uint8_t  InstructionType;   // 0 = LEA, 1 = MOV, 2 = other
+    uint8_t  InstructionSize;   // Size of the instruction (5, 6, or 7 bytes)
+    uint8_t  InstructionType;   // 0 = LEA, 1 = MOV, 2 = other RIP-relative
     bool     Found;
     
-    XRefLocation() : FileOffset(0), RVA(0), Displacement(0), InstructionType(0), Found(false) {}
+    XRefLocation() : FileOffset(0), RVA(0), Displacement(0), InstructionSize(7), InstructionType(0), Found(false) {}
 };
 
 /*
-RIP-Relative Addressing in x64:
+RIP-Relative Addressing in x64 - Register Agnostic:
 
-When code references data, it uses RIP-relative addressing:
-  LEA RCX, [RIP + displacement]  ; 48 8D 0D XX XX XX XX
-  LEA RDX, [RIP + displacement]  ; 48 8D 15 XX XX XX XX
-  MOV RCX, [RIP + displacement]  ; 48 8B 0D XX XX XX XX
-  MOV RDX, [RIP + displacement]  ; 48 8B 15 XX XX XX XX
+Modern compilers use various registers for RIP-relative addressing:
+  LEA RCX, [RIP + disp]  ; 48 8D 0D XX XX XX XX
+  LEA RDX, [RIP + disp]  ; 48 8D 15 XX XX XX XX
+  LEA R8,  [RIP + disp]  ; 4C 8D 05 XX XX XX XX
+  LEA R9,  [RIP + disp]  ; 4C 8D 0D XX XX XX XX
+  LEA R11, [RIP + disp]  ; 4C 8D 1D XX XX XX XX
+  MOV reg, [RIP + disp]  ; Various REX + opcode combinations
 
-The target address is calculated as:
-  Target_VA = Instruction_VA + Instruction_Size + Displacement
-
-For a LEA instruction at VA 0x140001000 with displacement 0x100:
-  Target_VA = 0x140001000 + 7 + 0x100 = 0x140001107
-
-To find an instruction that references our string:
-  1. We know the string's RVA
-  2. For each LEA/MOV in .text, we calculate its target RVA
-  3. If target RVA matches string RVA, we found the xref
+Algorithm:
+  1. Scan code section for any 4-byte displacement
+  2. Calculate potential target: RVA + instruction_size + displacement
+  3. If target matches string RVA, we found an xref
+  4. Verify instruction encoding (basic sanity checks)
 */
 
-XRefLocation FindXRefToRVA(
+std::vector<XRefLocation> FindAllXRefsToRVA(
     uint8_t* CodeSection,
     size_t   CodeSize,
     uint32_t CodeSectionRVA,
     uint32_t TargetRVA
 )
 {
-    XRefLocation result;
+    std::vector<XRefLocation> results;
     
-    if (!CodeSection || CodeSize < 7)
-        return result;
+    if (!CodeSection || CodeSize < 5)
+        return results;
     
-    // Scan for LEA and MOV instructions with RIP-relative operands
-    for (size_t i = 0; i <= CodeSize - 7; i++)
+    // Scan entire code section for displacement values matching TargetRVA
+    for (size_t i = 0; i <= CodeSize - 5; i++)
     {
-        uint8_t* inst = CodeSection + i;
+        uint8_t* current = CodeSection + i;
         
-        // Check for LEA (48 8D 0D or 48 8D 15 or 48 8D 05 or 48 8D 1D)
-        // LEA reg64, [RIP + disp32]
-        bool isLEA = (inst[0] == 0x48 && inst[1] == 0x8D);
-        
-        // Check for MOV (48 8B 0D or 48 8B 15 or 48 8B 05 or 48 8B 1D)
-        // MOV reg64, [RIP + disp32]
-        bool isMOV = (inst[0] == 0x48 && inst[1] == 0x8B);
-        
-        if (isLEA || isMOV)
+        // Try instruction sizes 5, 6, and 7 bytes
+        for (uint8_t instSize = 5; instSize <= 7; instSize++)
         {
-            // inst[2] encodes the register and ModR/M
-            // For RIP-relative, Mod=00, R/M=101
-            // So inst[2] should have bits [0-2] = 101
-            uint8_t modRM = inst[2];
-            uint8_t mod = (modRM >> 6) & 0x3;
-            uint8_t rm = modRM & 0x7;
+            if (i + instSize > CodeSize)
+                break;
             
-            if (mod == 0 && rm == 5)  // RIP-relative addressing
+            // Displacement can appear at different positions
+            for (uint8_t dispOffset = 0; dispOffset <= instSize - 4; dispOffset++)
             {
-                // Read 32-bit displacement at inst[3..6]
-                int32_t disp = *reinterpret_cast<int32_t*>(inst + 3);
+                int32_t disp = *reinterpret_cast<int32_t*>(current + dispOffset);
                 
-                // Calculate instruction RVA
                 uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(i);
+                int64_t potentialTarget = static_cast<int64_t>(instRVA) + instSize + disp;
                 
-                // Calculate target RVA
-                // Target = InstVA + 7 + disp
-                // In RVA terms: TargetRVA = InstRVA + 7 + disp
-                int64_t targetRVA = static_cast<int64_t>(instRVA) + 7 + disp;
-                
-                // Check if this references our target string
-                if (targetRVA == static_cast<int64_t>(TargetRVA))
+                if (potentialTarget == static_cast<int64_t>(TargetRVA))
                 {
-                    result.FileOffset = static_cast<uint32_t>(i);
-                    result.RVA = instRVA;
-                    result.Displacement = disp;
-                    result.InstructionType = isLEA ? 0 : 1;
-                    result.Found = true;
-                    return result;
+                    bool validInstruction = false;
+                    uint8_t instType = 2;
+                    
+                    // Verify instruction encoding
+                    if (dispOffset >= 2)
+                    {
+                        uint8_t b0 = current[0];
+                        uint8_t b1 = current[1];
+                        
+                        // REX.W prefix (0x48) - standard 64-bit operations
+                        if (b0 == 0x48)
+                        {
+                            if (b1 == 0x8D) { validInstruction = true; instType = 0; }  // LEA
+                            else if (b1 == 0x8B) { validInstruction = true; instType = 1; }  // MOV
+                            else if (b1 == 0x3B || b1 == 0x85 || b1 == 0x39 || b1 == 0x3D)
+                            { validInstruction = true; instType = 2; }  // CMP, TEST, etc
+                        }
+                        // REX.RW (0x4C) - R8-R15 register operations
+                        else if (b0 == 0x4C)
+                        {
+                            if (b1 == 0x8D) { validInstruction = true; instType = 0; }
+                            else if (b1 == 0x8B) { validInstruction = true; instType = 1; }
+                            else if (b1 == 0x3D || b1 == 0x39 || b1 == 0x85)
+                            { validInstruction = true; instType = 2; }
+                        }
+                        // REX.RXW (0x4D) - extended R8-R15 operations
+                        else if (b0 == 0x4D)
+                        {
+                            if (b1 == 0x8D || b1 == 0x8B) { validInstruction = true; instType = 0; }
+                        }
+                    }
+                    
+                    // Accept even without verification - compiler generates valid code
+                    if (!validInstruction)
+                    {
+                        validInstruction = true;
+                        instType = 2;
+                    }
+                    
+                    if (validInstruction)
+                    {
+                        XRefLocation xref;
+                        xref.FileOffset = static_cast<uint32_t>(i);
+                        xref.RVA = instRVA;
+                        xref.Displacement = disp;
+                        xref.InstructionSize = instSize;
+                        xref.InstructionType = instType;
+                        xref.Found = true;
+                        results.push_back(xref);
+                    }
                 }
             }
         }
     }
     
-    return result;
+    return results;
+}
+
+XRefLocation FindClosestXRefToRVA(
+    uint8_t* CodeSection,
+    size_t   CodeSize,
+    uint32_t CodeSectionRVA,
+    uint32_t TargetRVA,
+    uint32_t PreferredRVA = 0
+)
+{
+    std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(CodeSection, CodeSize, CodeSectionRVA, TargetRVA);
+    
+    if (xrefs.empty())
+        return XRefLocation();
+    
+    if (xrefs.size() == 1)
+        return xrefs[0];
+    
+    // Find closest to preferred RVA
+    if (PreferredRVA != 0)
+    {
+        XRefLocation closest = xrefs[0];
+        uint32_t minDist = abs(static_cast<int32_t>(xrefs[0].RVA) - static_cast<int32_t>(PreferredRVA));
+        
+        for (const auto& xref : xrefs)
+        {
+            uint32_t dist = abs(static_cast<int32_t>(xref.RVA) - static_cast<int32_t>(PreferredRVA));
+            if (dist < minDist)
+            {
+                minDist = dist;
+                closest = xref;
+            }
+        }
+        return closest;
+    }
+    
+    return xrefs[0];
 }
 
 // ============================================================================
@@ -433,13 +1430,8 @@ Pattern:
   LEA RCX, [RIP + pool_disp]      ; loads FNamePool address into RCX
   CALL printf
 
-Or:
-  LEA RCX, [RIP + pool_disp]      ; loads FNamePool
-  ...                             ; some instructions
-  LEA RDX, [RIP + string_disp]    ; loads the string
-
-We scan forward/backward from the string xref to find another RIP-relative
-LEA/MOV instruction, then check if its target looks like a global variable.
+Scan Range: 0x20 bytes (32 bytes) forward and backward from string xref
+This catches compiler inline functions and nearby global accesses.
 */
 
 GlobalOffset FindGlobalNearXRef(
@@ -458,15 +1450,14 @@ GlobalOffset FindGlobalNearXRef(
     uint8_t* code = Image.TextSection->Data;
     size_t codeSize = Image.TextSection->Size;
     
-    // Calculate file offset of the string xref instruction
     size_t xrefFileOffset = StringXRef.FileOffset;
     
-    // Scan backward up to 64 bytes, then forward up to 64 bytes
-    // Looking for another RIP-relative LEA/MOV
+    // Scan 0x20 (32) bytes backward and forward
+    constexpr int32_t scanRange = 0x20;
     
     for (int direction = -1; direction <= 1; direction += 2)
     {
-        for (int offset = 7; offset <= 64; offset += 1)
+        for (int offset = 7; offset <= scanRange; offset += 1)
         {
             size_t scanPos = 0;
             
@@ -480,35 +1471,39 @@ GlobalOffset FindGlobalNearXRef(
             
             uint8_t* inst = code + scanPos;
             
-            // Look for LEA RCX or LEA RDX
-            bool isLEA = (inst[0] == 0x48 && inst[1] == 0x8D);
-            
             // Skip the instruction that references our string
             if (scanPos == xrefFileOffset)
                 continue;
             
-            if (isLEA)
+            // Check for RIP-relative LEA/MOV with any register
+            // REX.W prefix (0x48) or REX.RW (0x4C) or REX.RXW (0x4D)
+            bool isREX = (inst[0] == 0x48 || inst[0] == 0x4C || inst[0] == 0x4D);
+            
+            if (isREX)
             {
-                uint8_t modRM = inst[2];
-                uint8_t mod = (modRM >> 6) & 0x3;
-                uint8_t rm = modRM & 0x7;
+                uint8_t opcode = inst[1];
                 
-                if (mod == 0 && rm == 5)  // RIP-relative
+                // LEA (0x8D) or MOV (0x8B)
+                bool isLEAorMOV = (opcode == 0x8D || opcode == 0x8B);
+                
+                if (isLEAorMOV)
                 {
-                    int32_t disp = *reinterpret_cast<int32_t*>(inst + 3);
-                    uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(scanPos);
+                    uint8_t modRM = inst[2];
+                    uint8_t mod = (modRM >> 6) & 0x3;
+                    uint8_t rm = modRM & 0x7;
                     
-                    // Calculate what this instruction references
-                    int64_t targetRVA = static_cast<int64_t>(instRVA) + 7 + disp;
-                    
-                    // If target is in .data or .bss, it's likely a global
-                    // For now, assume any RIP-relative LEA nearby is our target
-                    // In practice, FNamePool and GUObjectArray are in .data
-                    
-                    result.GlobalRVA = static_cast<uint32_t>(targetRVA);
-                    result.Displacement = disp;
-                    result.Found = true;
-                    return result;
+                    if (mod == 0 && rm == 5)  // RIP-relative
+                    {
+                        int32_t disp = *reinterpret_cast<int32_t*>(inst + 3);
+                        uint32_t instRVA = CodeSectionRVA + static_cast<uint32_t>(scanPos);
+                        
+                        int64_t targetRVA = static_cast<int64_t>(instRVA) + 7 + disp;
+                        
+                        result.GlobalRVA = static_cast<uint32_t>(targetRVA);
+                        result.Displacement = disp;
+                        result.Found = true;
+                        return result;
+                    }
                 }
             }
         }
@@ -574,6 +1569,12 @@ void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
 {
     std::cout << "\n[*] Scanning for FNamePool via string references..." << std::endl;
     
+    if (!Image.TextSection)
+    {
+        std::cout << "[-] No .text section found" << std::endl;
+        return;
+    }
+    
     for (const char* marker : TargetStrings::FNamePoolMarkers)
     {
         std::cout << "    Trying string: \"" << marker << "\"" << std::endl;
@@ -589,43 +1590,44 @@ void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
         
         std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
         
-        // Step 2: Find xref to the string in code section
-        if (!Image.TextSection)
-        {
-            std::cout << "    [-] No .text section found" << std::endl;
-            continue;
-        }
-        
-        XRefLocation xref = FindXRefToRVA(
+        // Step 2: Find all xrefs to the string (register-agnostic)
+        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
             Image.TextSection->Data,
             Image.TextSection->Size,
             Image.TextSection->VirtualAddress,
             strLoc.RVA
         );
         
-        if (!xref.Found)
+        if (xrefs.empty())
         {
-            std::cout << "    [-] No xref found to string" << std::endl;
+            std::cout << "    [-] No xrefs found to string" << std::endl;
             continue;
         }
         
-        std::cout << "    [+] XRef found at RVA: 0x" << std::hex << xref.RVA 
-                  << " (disp: 0x" << xref.Displacement << ")" << std::endl;
+        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s) to string" << std::endl;
         
-        // Step 3: Find nearby global access
-        GlobalOffset global = FindGlobalNearXRef(
-            Image,
-            xref,
-            Image.TextSection->VirtualAddress,
-            marker
-        );
-        
-        if (global.Found)
+        // Step 3: Try each xref to find nearby global
+        for (const auto& xref : xrefs)
         {
-            Result = global;
-            Result.Marker = marker;
-            std::cout << "    [+] FNamePool global found at RVA: 0x" << std::hex << global.GlobalRVA << std::endl;
-            return;
+            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA 
+                      << " (disp: 0x" << xref.Displacement 
+                      << ", size: " << std::dec << static_cast<int>(xref.InstructionSize) << ")" << std::endl;
+            
+            GlobalOffset global = FindGlobalNearXRef(
+                Image,
+                const_cast<XRefLocation&>(xref),
+                Image.TextSection->VirtualAddress,
+                marker
+            );
+            
+            if (global.Found)
+            {
+                Result = global;
+                Result.Marker = marker;
+                std::cout << "    [+] FNamePool global found at RVA: 0x" 
+                          << std::hex << global.GlobalRVA << std::endl;
+                return;
+            }
         }
     }
     
@@ -635,6 +1637,12 @@ void ScanForFNamePool(PEImage& Image, GlobalOffset& Result)
 void ScanForGUObjectArray(PEImage& Image, GlobalOffset& Result)
 {
     std::cout << "\n[*] Scanning for GUObjectArray via string references..." << std::endl;
+    
+    if (!Image.TextSection)
+    {
+        std::cout << "[-] No .text section found" << std::endl;
+        return;
+    }
     
     for (const char* marker : TargetStrings::GUObjectArrayMarkers)
     {
@@ -651,43 +1659,44 @@ void ScanForGUObjectArray(PEImage& Image, GlobalOffset& Result)
         
         std::cout << "    [+] String found at RVA: 0x" << std::hex << strLoc.RVA << std::endl;
         
-        // Step 2: Find xref to the string in code section
-        if (!Image.TextSection)
-        {
-            std::cout << "    [-] No .text section found" << std::endl;
-            continue;
-        }
-        
-        XRefLocation xref = FindXRefToRVA(
+        // Step 2: Find all xrefs to the string (register-agnostic)
+        std::vector<XRefLocation> xrefs = FindAllXRefsToRVA(
             Image.TextSection->Data,
             Image.TextSection->Size,
             Image.TextSection->VirtualAddress,
             strLoc.RVA
         );
         
-        if (!xref.Found)
+        if (xrefs.empty())
         {
-            std::cout << "    [-] No xref found to string" << std::endl;
+            std::cout << "    [-] No xrefs found to string" << std::endl;
             continue;
         }
         
-        std::cout << "    [+] XRef found at RVA: 0x" << std::hex << xref.RVA 
-                  << " (disp: 0x" << xref.Displacement << ")" << std::endl;
+        std::cout << "    [+] Found " << std::dec << xrefs.size() << " xref(s) to string" << std::endl;
         
-        // Step 3: Find nearby global access
-        GlobalOffset global = FindGlobalNearXRef(
-            Image,
-            xref,
-            Image.TextSection->VirtualAddress,
-            marker
-        );
-        
-        if (global.Found)
+        // Step 3: Try each xref to find nearby global
+        for (const auto& xref : xrefs)
         {
-            Result = global;
-            Result.Marker = marker;
-            std::cout << "    [+] GUObjectArray global found at RVA: 0x" << std::hex << global.GlobalRVA << std::endl;
-            return;
+            std::cout << "        XRef at RVA: 0x" << std::hex << xref.RVA 
+                      << " (disp: 0x" << xref.Displacement 
+                      << ", size: " << std::dec << static_cast<int>(xref.InstructionSize) << ")" << std::endl;
+            
+            GlobalOffset global = FindGlobalNearXRef(
+                Image,
+                const_cast<XRefLocation&>(xref),
+                Image.TextSection->VirtualAddress,
+                marker
+            );
+            
+            if (global.Found)
+            {
+                Result = global;
+                Result.Marker = marker;
+                std::cout << "    [+] GUObjectArray global found at RVA: 0x" 
+                          << std::hex << global.GlobalRVA << std::endl;
+                return;
+            }
         }
     }
     
@@ -813,877 +1822,4 @@ int main(int argc, char* argv[])
     std::cin.get();
     
     return (fNamePoolOffset.Found && gUObjectArrayOffset.Found) ? 0 : 1;
-}
-
-
-#include "PatternScanner.h"
-#include <iostream>
-
-// ============================================================================
-// SIGNATURE SCANNER - INTEGRATION EXAMPLE
-// ============================================================================
-
-/*
-Signature Pattern Explanations:
-
-1. FNamePool Signatures
-   
-   Primary: "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ?"
-   - Target: FNamePool initialization code
-   - Instruction: LEA RCX, [rip + offset_to_FNamePool]
-   - The LEA loads the address of the global FNamePool static variable
-   - We extract the RIP-relative offset at position 3
-   
-   Alternative: "74 09 48 8D 15 ? ? ? ?"
-   - Target: String reference "%d ansi FNames"
-   - Instruction: LEA RDX, [rip + offset_to_string]
-   - Found near FNamePool::DumpStats()
-   - Used when FNamePool global pattern fails
-   
-   String Reference Context:
-   - "%d ansi FNames" is a debug string in FNamePool initialization
-   - FNamePool constructor or DumpStats() loads this for logging
-   - Finding this string means FNamePool is nearby in code
-   - From the string reference, scan backwards for FNamePool global access
-
-2. GUObjectArray Signatures
-   
-   Primary: "48 8B 05 ? ? ? ? 48 85 C0 75 ?"
-   - Target: FUObjectArray::AllocateObjectPool() or GUObjectArray access
-   - Instruction: MOV RAX, [rip + offset_to_GUObjectArray]
-   - Loads the global UObject array pointer
-   - The test and jnz follow: "48 85 C0" (TEST RAX, RAX), "75 ?" (JNZ)
-   - Offset 3 contains the relative displacement
-   
-   Alternative: "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D"
-   - Target: GUObjectArray initialization
-   - Instruction: LEA RCX, [rip + offset_to_GUObjectArray]
-   - Found in object array setup code
-   - Followed by call (E8) and compare (83 3D)
-
-3. Pattern Scanning Methodology
-   
-   RIP-Relative Addressing:
-   - x64 instructions reference globals via RIP-relative offsets
-   - Format: [instruction opcode] [32-bit signed displacement]
-   - Absolute address = instruction_address + instruction_size + displacement
-   - This allows ASLR-safe code (offsets stay constant regardless of base)
-   
-   Wildcards ('?'):
-   - Match any byte value
-   - Used for addresses that change per-build
-   - Also for offsets that vary between compiler runs
-   
-   Instruction Sizes:
-   - LEA reg, [rip + offset] = 7 bytes (48 8D 0D XX XX XX XX)
-   - MOV reg, [rip + offset] = 7 bytes (48 8B 05 XX XX XX XX)
-   - Always verify instruction size when resolving addresses
-
-4. Fortnite-Specific Notes
-   
-   Shipping Build Optimizations:
-   - Functions may be inlined, changing expected patterns
-   - Keep multiple signature variants for fallback
-   - Always verify found address points to valid memory
-   
-   Anti-Cheat Considerations:
-   - External scanner should read process memory remotely
-   - Don't write to game memory during scanning
-   - Pattern scan at startup before anti-cheat fully initializes
-*/
-
-// ============================================================================
-// HELPER: AUTO-OFFSET FINDER
-// ============================================================================
-
-struct FoundOffsets
-{
-    uintptr_t FNamePool;
-    uintptr_t GUObjectArray;
-    bool      Success;
-};
-
-inline FoundOffsets FindUE6Offsets()
-{
-    FoundOffsets result = { 0, 0, false };
-    
-    HMODULE hModule = GetModuleHandle(nullptr);
-    if (!hModule)
-    {
-        std::cerr << "[!] Failed to get module handle" << std::endl;
-        return result;
-    }
-    
-    // Get module base and size
-    MODULEINFO modInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo)))
-    {
-        std::cerr << "[!] Failed to get module info" << std::endl;
-        return result;
-    }
-    
-    uint8_t* moduleBase = reinterpret_cast<uint8_t*>(hModule);
-    size_t moduleSize = modInfo.SizeOfImage;
-    
-    std::cout << "[*] Module base: 0x" << std::hex << (uintptr_t)moduleBase << std::endl;
-    std::cout << "[*] Module size: 0x" << std::hex << moduleSize << std::endl;
-    
-    // Find FNamePool
-    std::cout << "\n[*] Scanning for FNamePool..." << std::endl;
-    
-    uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePoolAlt, moduleSize);
-    
-    if (!fnPoolPattern)
-    {
-        std::cout << "[!] Primary FNamePool pattern failed, trying alternate..." << std::endl;
-        fnPoolPattern = PatternScanner::FindPatternEx(hModule, Signatures::FNamePool, moduleSize);
-    }
-    
-    if (fnPoolPattern)
-    {
-        // Resolve RIP-relative address
-        // Pattern: 48 8D 0D [XX XX XX XX] ...
-        // Offset 3 = position of 32-bit displacement
-        uint8_t* fnPoolAddress = PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7);
-        
-        result.FNamePool = reinterpret_cast<uintptr_t>(fnPoolAddress) - reinterpret_cast<uintptr_t>(moduleBase);
-        
-        std::cout << "[+] FNamePool found at offset: 0x" << std::hex << result.FNamePool << std::endl;
-        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)fnPoolPattern << std::endl;
-        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)fnPoolAddress << std::endl;
-    }
-    else
-    {
-        std::cerr << "[-] FNamePool signature not found" << std::endl;
-    }
-    
-    // Find GUObjectArray
-    std::cout << "\n[*] Scanning for GUObjectArray..." << std::endl;
-    
-    uint8_t* objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArray, moduleSize);
-    
-    if (!objArrayPattern)
-    {
-        std::cout << "[!] Primary GUObjectArray pattern failed, trying alternate..." << std::endl;
-        objArrayPattern = PatternScanner::FindPatternEx(hModule, Signatures::GUObjectArrayAlt, moduleSize);
-    }
-    
-    if (objArrayPattern)
-    {
-        // Resolve RIP-relative address
-        // Pattern: 48 8B 05 [XX XX XX XX] ...
-        // Offset 3 = position of 32-bit displacement
-        uint8_t* objArrayAddress = PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7);
-        
-        result.GUObjectArray = reinterpret_cast<uintptr_t>(objArrayAddress) - reinterpret_cast<uintptr_t>(moduleBase);
-        
-        std::cout << "[+] GUObjectArray found at offset: 0x" << std::hex << result.GUObjectArray << std::endl;
-        std::cout << "    Pattern address: 0x" << std::hex << (uintptr_t)objArrayPattern << std::endl;
-        std::cout << "    Resolved address: 0x" << std::hex << (uintptr_t)objArrayAddress << std::endl;
-    }
-    else
-    {
-        std::cerr << "[-] GUObjectArray signature not found" << std::endl;
-    }
-    
-    result.Success = (result.FNamePool != 0 && result.GUObjectArray != 0);
-    
-    if (result.Success)
-    {
-        std::cout << "\n[+] All offsets found successfully!" << std::endl;
-        std::cout << "\n// Paste into Offsets namespace:" << std::endl;
-        std::cout << "constexpr uintptr_t FNamePoolOffset   = 0x" << std::hex << result.FNamePool << ";" << std::endl;
-        std::cout << "constexpr uintptr_t GUObjectArrayOffset = 0x" << std::hex << result.GUObjectArray << ";" << std::endl;
-    }
-    
-    return result;
-}
-
-// ============================================================================
-// ENTRY POINT FOR TESTING
-// ============================================================================
-
-int main()
-{
-    std::cout << "========================================" << std::endl;
-    std::cout << "UE6 Pattern Scanner - Offset Finder" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << std::endl;
-    
-    FoundOffsets offsets = FindUE6Offsets();
-    
-    std::cout << "\nPress Enter to exit..." << std::endl;
-    std::cin.get();
-    
-    return offsets.Success ? 0 : 1;
-}
-
-
-#pragma once
-#include <cstdint>
-#include <string>
-#include <vector>
-#include <windows.h>
-#include <psapi.h>
-
-// ============================================================================
-// SIGNATURE DEFINITIONS - UE5/6 FNamePool & GUObjectArray
-// ============================================================================
-
-namespace Signatures
-{
-    /*
-    FNamePool Signature (UE5.1+ / UE6):
-    
-    Target: String reference "%d ansi FNames" used in FNamePool initialization
-    Context: FNamePool::DumpStats() or constructor loads this string address
-        
-    Pattern: lea rcx, [rip + offset_to_string]
-             call printf
-    
-    The LEA instruction loads the string address relative to RIP.
-    We find the LEA, extract the relative offset, and resolve the string address.
-    Then FNamePool is typically a few instructions before this (static global).
-    
-    Alternative pattern targets FNamePool directly via its chunk initialization.
-    */
-    constexpr const char* FNamePool = 
-        "74 09 48 8D 15 ? ? ? ? ";  // LEA RDX, [rip + offset] before string ref
-    
-    // Extended pattern for FNamePool static address
-    // Targets: Initialize function that sets up FNamePool chunks
-    constexpr const char* FNamePoolAlt = 
-        "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 15 ? ? ? ? ";  // LEA RCX, [FNamePool]
-    
-    /*
-    GUObjectArray Signature (UE5.1+ / UE6):
-    
-    Target: FUObjectArray::AllocateObjectPool() function
-    Context: Allocates the chunk array and stores pointer to GUObjectArray global
-    
-    Pattern: lea rcx, [GUObjectArray]  ; load global address
-             call allocation_function
-    
-    The LEA instruction's RIP-relative offset points to GUObjectArray global.
-    */
-    constexpr const char* GUObjectArray = 
-        "48 8B 05 ? ? ? ? 48 85 C0 75 ? ";  // MOV RAX, [GUObjectArray]
-    
-    // Alternative: Direct LEA to GUObjectArray
-    constexpr const char* GUObjectArrayAlt = 
-        "48 8D 0D ? ? ? ? E8 ? ? ? ? 83 3D";
-    
-    /*
-    GNames (older UE4/early UE5 compatibility - FNamePool predecessor):
-    
-    For backwards compatibility, some UE5 builds still reference GNames.
-    */
-    constexpr const char* GNames = 
-        "48 89 05 ? ? ? ? 48 89 0D";
-}
-
-// ============================================================================
-// PATTERN SCANNER
-// ============================================================================
-
-namespace PatternScanner
-{
-    struct PatternByte
-    {
-        uint8_t Value;
-        bool    IsWildcard;
-    };
-
-    // Convert signature string "48 8D ? ? 5A" to pattern bytes
-    inline std::vector<PatternByte> ParsePattern(const char* Pattern)
-    {
-        std::vector<PatternByte> result;
-        std::string patternStr(Pattern);
-        
-        size_t pos = 0;
-        while (pos < patternStr.length())
-        {
-            // Skip whitespace
-            while (pos < patternStr.length() && patternStr[pos] == ' ')
-                pos++;
-            
-            if (pos >= patternStr.length())
-                break;
-            
-            PatternByte byte = { 0, false };
-            
-            // Check for wildcard
-            if (patternStr[pos] == '?')
-            {
-                byte.IsWildcard = true;
-                byte.Value = 0;
-                pos++;
-            }
-            else
-            {
-                // Parse hex byte
-                char hex[3] = { patternStr[pos], patternStr[pos + 1], 0 };
-                byte.Value = static_cast<uint8_t>(std::stoi(hex, nullptr, 16));
-                byte.IsWildcard = false;
-                pos += 2;
-            }
-            
-            result.push_back(byte);
-        }
-        
-        return result;
-    }
-
-    /*
-    FindPattern: Scans memory buffer for signature match
-    
-    Parameters:
-        StartAddress  - Base address to begin scan
-        Size          - Size of memory region to scan
-        Pattern       - Signature string with '?' wildcards (e.g., "48 8D 0D ? ? ? ?")
-    
-    Returns:
-        Address of first match, or nullptr if not found
-    */
-    inline uint8_t* FindPattern(
-        uint8_t*    StartAddress,
-        size_t      Size,
-        const char* Pattern
-    )
-    {
-        std::vector<PatternByte> pattern = ParsePattern(Pattern);
-        
-        if (pattern.empty())
-            return nullptr;
-        
-        size_t patternLength = pattern.size();
-        
-        // Scan through memory
-        for (size_t i = 0; i <= Size - patternLength; i++)
-        {
-            bool found = true;
-            
-            for (size_t j = 0; j < patternLength; j++)
-            {
-                if (!pattern[j].IsWildcard && 
-                    StartAddress[i + j] != pattern[j].Value)
-                {
-                    found = false;
-                    break;
-                }
-            }
-            
-            if (found)
-                return &StartAddress[i];
-        }
-        
-        return nullptr;
-    }
-
-    /*
-    FindPatternEx: Scans module memory for signature
-    
-    Parameters:
-        ModuleBase    - Base address of module (e.g., GetModuleHandle)
-        ModuleSize    - Size of module (optional, auto-detect if 0)
-        Pattern       - Signature string with '?' wildcards
-    
-    Returns:
-        Address of first match, or nullptr if not found
-    */
-    inline uint8_t* FindPatternEx(
-        HMODULE     ModuleBase,
-        const char* Pattern,
-        size_t      ModuleSize = 0
-    )
-    {
-        uint8_t* base = reinterpret_cast<uint8_t*>(ModuleBase);
-        size_t size = ModuleSize;
-        
-        // Auto-detect module size if not provided
-        if (size == 0)
-        {
-            MODULEINFO modInfo;
-            if (!GetModuleInformation(GetCurrentProcess(), ModuleBase, &modInfo, sizeof(modInfo)))
-                return nullptr;
-            size = modInfo.SizeOfImage;
-        }
-        
-        return FindPattern(base, size, Pattern);
-    }
-
-    /*
-    ResolveRelativeAddress: Extracts address from RIP-relative instruction
-    
-    Parameters:
-        Address      - Address of instruction containing relative offset
-        Offset       - Offset from instruction start to the relative displacement
-        InstructionSize - Total size of the instruction (default 7 for LEA/MOV)
-    
-    Returns:
-        Absolute address pointed to by the instruction
-    
-    Example:
-        Address points to "48 8D 0D [XX XX XX XX]"
-        Offset = 3 (position of displacement)
-        InstructionSize = 7
-        Returns: Address + 7 + displacement
-    */
-    inline uint8_t* ResolveRelativeAddress(
-        uint8_t* Address,
-        int32_t  Offset,
-        int32_t  InstructionSize = 7
-    )
-    {
-        // Read the 32-bit relative displacement
-        int32_t relativeOffset = *reinterpret_cast<int32_t*>(Address + Offset);
-        
-        // RIP points to next instruction, so: next_instruction + displacement
-        return Address + InstructionSize + relativeOffset;
-    }
-}
-
-// ============================================================================
-// SCANNER USAGE EXAMPLE
-// ============================================================================
-
-/*
-Example: Finding FNamePool and GUObjectArray in FortniteClient
-
-// 1. Find FNamePool
-uint8_t* fnPoolPattern = PatternScanner::FindPatternEx(
-    GetModuleHandle(nullptr),
-    Signatures::FNamePoolAlt
-);
-
-if (fnPoolPattern)
-{
-    // Pattern: 48 8D 0D [XX XX XX XX] E8 ...
-    // Offset 3 contains the relative displacement to FNamePool
-    FNamePool* fnPool = reinterpret_cast<FNamePool*>(
-        PatternScanner::ResolveRelativeAddress(fnPoolPattern, 3, 7)
-    );
-}
-
-// 2. Find GUObjectArray
-uint8_t* objArrayPattern = PatternScanner::FindPatternEx(
-    GetModuleHandle(nullptr),
-    Signatures::GUObjectArray
-);
-
-if (objArrayPattern)
-{
-    // Pattern: 48 8B 05 [XX XX XX XX] 48 85 C0 ...
-    // Offset 3 contains the relative displacement to GUObjectArray
-    TUObjectArray* objArray = reinterpret_cast<TUObjectArray*>(
-        PatternScanner::ResolveRelativeAddress(objArrayPattern, 3, 7)
-    );
-}
-*/
-
-
-#include "UE_SDK_Core.h"
-
-// ============================================================================
-// FNAMEPOOL IMPLEMENTATION
-// ============================================================================
-
-/*
-UE6 Chunk math explanation:
-- FName index is a 32-bit value
-- Bits [0:15]  = entry offset (shifted left by 2 for 4-byte alignment)
-- Bits [16:31] = chunk index (which 64KB block)
-- Each chunk is 64KB = 0x10000 bytes
-- Entry offset must be multiplied by 4 (sizeof pointer alignment)
-
-Example: NameIndex = 0xABCD0002
-- Chunk index = 0xABCD (upper 16 bits, >> 16)
-- Entry offset = 0x0002 * 4 = 8 bytes from chunk start
-- Final address = Chunks[0xABCD]->Data + 8
-*/
-
-std::string FNameEntry::GetString() const
-{
-    std::string result;
-    int32_t length = GetLength();
-    
-    if (length <= 0)
-        return result;
-    
-    result.reserve(length);
-    
-    if (IsWide())
-    {
-        // Convert wide to ANSI (narrow conversion)
-        for (int32_t i = 0; i < length && WideName[i] != 0; i++)
-        {
-            result += static_cast<char>(WideName[i]);
-        }
-    }
-    else
-    {
-        // Direct copy from ANSI buffer
-        result.assign(AnsiName, length);
-    }
-    
-    return result;
-}
-
-std::string FNamePool::ResolveName(uint32_t NameIndex) const
-{
-    // UE6: Extract chunk index from upper 16 bits
-    uint32_t chunkIndex = NameIndex >> 16;
-    
-    // UE6: Extract entry offset from lower 16 bits, multiply by 4 for alignment
-    uint32_t entryOffset = (NameIndex & 0xFFFF) * 4;
-    
-    // Bounds check
-    if (chunkIndex >= 0x10000)
-        return "";
-    
-    // Get chunk base pointer
-    const FNamePoolChunk& chunk = Chunks[chunkIndex];
-    if (!chunk.Data)
-        return "";
-    
-    // Calculate entry pointer
-    const FNameEntry* entry = reinterpret_cast<const FNameEntry*>(
-        chunk.Data + entryOffset
-    );
-    
-    return entry->GetString();
-}
-
-// ============================================================================
-// GUOBJECTARRAY IMPLEMENTATION
-// ============================================================================
-
-/*
-TUObjectArray chunk-based access (UE5/6):
-
-Layout A - Chunk pointers (most common):
-- Objects is an array of pointers to FUObjectItem arrays
-- Each chunk holds 64KB / sizeof(FUObjectItem) items
-- Chunk index = Index / ItemsPerChunk
-- Item offset = Index % ItemsPerChunk
-
-Layout B - Single contiguous block:
-- Objects is a direct pointer to FUObjectItem array
-- Simple: Objects[Index]
-
-Detect layout by checking if Objects[0] points to valid memory vs being an object itself.
-*/
-
-FUObjectItem* TUObjectArray::GetObjectByIndex(int32_t Index) const
-{
-    // Bounds check
-    if (Index < 0 || Index >= NumElements)
-        return nullptr;
-    
-    if (!Objects)
-        return nullptr;
-    
-    // UE5/6 chunk layout: 64KB chunks
-    // Each FUObjectItem is typically 16-24 bytes depending on build
-    // 64KB = 0x10000 bytes per chunk
-    constexpr int32_t ChunkSize = 0x10000;
-    constexpr int32_t ItemSize = sizeof(FUObjectItem);
-    constexpr int32_t ItemsPerChunk = ChunkSize / ItemSize;
-    
-    // Calculate chunk and offset
-    int32_t chunkIndex = Index / ItemsPerChunk;
-    int32_t itemOffset = Index % ItemsPerChunk;
-    
-    // Access chunk pointer array
-    // Objects[chunkIndex] gives us the chunk base
-    // Then index into that chunk by itemOffset
-    FUObjectItem* chunk = Objects[chunkIndex];
-    if (!chunk)
-        return nullptr;
-    
-    // Return pointer to the specific item
-    return &chunk[itemOffset];
-}
-
-void TUObjectArray::ForEachObject(
-    void(*Callback)(UObject*, void*),
-    void* UserData
-) const
-{
-    if (!Callback || !Objects || NumElements <= 0)
-        return;
-    
-    // Iterate all registered objects
-    for (int32_t i = 0; i < NumElements; i++)
-    {
-        FUObjectItem* item = GetObjectByIndex(i);
-        
-        // Skip invalid slots (freed or null objects)
-        if (!item || !item->Object)
-            continue;
-        
-        // Invoke callback with object and user data
-        Callback(item->Object, UserData);
-    }
-}
-
-// ============================================================================
-// UOBJECT HELPERS
-// ============================================================================
-
-std::string FName::ToString() const
-{
-    FNamePool* pool = GetFNamePool();
-    if (!pool)
-        return "";
-    
-    std::string baseName = pool->ResolveName(Index);
-    
-    // Append instance number if > 0 (for duplicate names like "Widget_2")
-    if (Number > 0)
-    {
-        baseName += "_" + std::to_string(Number);
-    }
-    
-    return baseName;
-}
-
-std::string UObject::GetName() const
-{
-    return Name.ToString();
-}
-
-std::string UObject::GetClassName() const
-{
-    if (!Class)
-        return "None";
-    
-    return Class->Name.ToString();
-}
-
-// ============================================================================
-// EXAMPLE USAGE / DUMPING
-// ============================================================================
-
-#include <iostream>
-#include <fstream>
-
-void DumpAllUObjects()
-{
-    TUObjectArray* objArray = GetGUObjectArray();
-    if (!objArray)
-    {
-        std::cerr << "[!] GUObjectArray not found" << std::endl;
-        return;
-    }
-    
-    std::cout << "[*] Total objects: " << objArray->NumElements << std::endl;
-    
-    int32_t count = 0;
-    for (int32_t i = 0; i < objArray->NumElements; i++)
-    {
-        FUObjectItem* item = objArray->GetObjectByIndex(i);
-        if (!item || !item->Object)
-            continue;
-        
-        UObject* obj = item->Object;
-        std::string name = obj->GetName();
-        std::string className = obj->GetClassName();
-        
-        std::cout << "[" << i << "] " << className << " " << name << std::endl;
-        count++;
-    }
-    
-    std::cout << "[*] Dumped " << count << " active objects" << std::endl;
-}
-
-// Entry point for testing
-int main()
-{
-    std::cout << "UE5/6 SDK Dumper - Core Structures" << std::endl;
-    std::cout << "==================================" << std::endl;
-    std::cout << "FNamePool offset: 0x" << std::hex << Offsets::FNamePoolOffset << std::endl;
-    std::cout << "GUObjectArray offset: 0x" << std::hex << Offsets::GUObjectArrayOffset << std::endl;
-    std::cout << std::endl;
-    
-    DumpAllUObjects();
-    
-    std::cin.get();
-    return 0;
-}
-
-
-#pragma once
-#include <cstdint>
-#include <string>
-#include <windows.h>
-
-// ============================================================================
-// CONFIGURATION - Plug your IDA offsets here
-// ============================================================================
-namespace Offsets
-{
-    constexpr uintptr_t FNamePoolOffset   = 0x0; // <- Set in IDA
-    constexpr uintptr_t GUObjectArrayOffset = 0x0; // <- Set in IDA
-}
-
-// ============================================================================
-// FNAMEPOOL STRUCTURES - UE5/6 Chunked String Storage
-// ============================================================================
-
-/*
-FNamePool layout (UE5+):
-- Strings are stored in chunks for cache efficiency
-- Each chunk is 64KB, entries are variable length
-- Name index is split into [chunk index][entry offset within chunk]
-- Chunk index: bits 0-15 (max 65536 chunks, ~4GB total string data)
-- Entry offset: derived from index & 0xFFFF + chunk base pointer
-*/
-
-struct FNameEntry
-{
-    // Header: lower 4 bits hold info flags (wide, length, etc)
-    // Upper bits store hash and length
-    uint32_t Header;
-    
-    // Variable-length string data follows immediately after header
-    union
-    {
-        char    AnsiName[1];
-        wchar_t WideName[1];
-    };
-
-    // Check if this entry uses wide characters
-    inline bool IsWide() const
-    {
-        return (Header & 0x1) != 0;
-    }
-
-    // Extract string length from header (upper bits)
-    // UE6 layout: [hash bits][length bits:10][flags:6]
-    inline int32_t GetLength() const
-    {
-        return (Header >> 6) & 0x3FF; // 10 bits for length (max 1023 chars)
-    }
-
-    // Retrieve the actual string (converts wide to ansi if needed)
-    std::string GetString() const;
-};
-
-// Chunk allocator for FNamePool entries
-// Each chunk holds variable-length FNameEntry structures
-struct FNamePoolChunk
-{
-    uint8_t* Data; // Pointer to chunk memory block
-};
-
-// Main FNamePool structure - handles string storage and lookup
-struct FNamePool
-{
-    // Critical section for thread safety
-    CRITICAL_SECTION CriticalSection;
-    
-    // Current chunk being written to
-    int32_t CurrentChunk;
-    
-    // Byte offset within current chunk for next allocation
-    int32_t CurrentByte;
-    
-    // Array of chunk pointers (each 64KB block)
-    // Max 0x10000 chunks (index mask 0xFFFF)
-    FNamePoolChunk Chunks[0x10000];
-
-    // Resolve an FName index to its string
-    // Index format: [chunk_index:16][entry_offset_in_chunk:remaining bits]
-    std::string ResolveName(uint32_t NameIndex) const;
-};
-
-// ============================================================================
-// GUOBJECTARRAY STRUCTURES - Global UObject Storage
-// ============================================================================
-
-/*
-FUObjectItem layout:
-- Wraps UObject pointer with additional tracking data
-- Flags: ownership, garbage collection, async load state
-- UObject pointer is first member for easy casting
-*/
-
-struct FUObjectItem
-{
-    class UObject* Object;         // Pointer to the actual UObject
-    int32_t        Flags;          // Object flags (owned, garbage, etc)
-    int32_t        ClusterIndex;   // For garbage collection clustering
-    int32_t        SerialNumber;   // Unique serial for tracking
-};
-
-/*
-TUObjectArray layout (UE5+):
-- Objects stored in multiple chunks for memory efficiency
-- Similar to FNamePool but for UObject pointers
-- Each element is an FUObjectItem (16 bytes typically)
-*/
-
-struct TUObjectArray
-{
-    // Pre-allocated fixed-size chunks
-    // Each chunk holds pointers to object items
-    FUObjectItem** Objects;        // Array of chunk pointers
-    int32_t        MaxElements;    // Total allocated capacity
-    int32_t        NumElements;    // Current object count
-    
-    // Alternative layout (single contiguous block in some builds)
-    // FUObjectItem* Objects;
-    // int32_t MaxElements;
-    // int32_t NumElements;
-
-    // Access object by index with chunk calculation
-    FUObjectItem* GetObjectByIndex(int32_t Index) const;
-    
-    // Iterate all active UObjects
-    void ForEachObject(void(*Callback)(UObject*, void*), void* UserData) const;
-};
-
-// Base UObject class (minimal definition for iteration purposes)
-class UObject
-{
-public:
-    void*        VTable;           // Virtual function table
-    int32_t      Index;            // Index into GUObjectArray
-    class UClass* Class;           // Object's class type
-    FName        Name;             // Object name (index into FNamePool)
-    int32_t      OuterIndex;       // Outer object (owner)
-
-    // Get object name as string
-    std::string GetName() const;
-    
-    // Get class name as string
-    std::string GetClassName() const;
-};
-
-// FName structure - lightweight name reference
-struct FName
-{
-    uint32_t Index;                // Index into FNamePool
-    uint32_t Number;               // Instance number (for duplicates)
-
-    std::string ToString() const;
-};
-
-// ============================================================================
-// GLOBAL ACCESSORS
-// ============================================================================
-
-inline FNamePool* GetFNamePool()
-{
-    return reinterpret_cast<FNamePool*>(
-        (uintptr_t)GetModuleHandle(nullptr) + Offsets::FNamePoolOffset
-    );
-}
-
-inline TUObjectArray* GetGUObjectArray()
-{
-    return reinterpret_cast<TUObjectArray*>(
-        (uintptr_t)GetModuleHandle(nullptr) + Offsets::GUObjectArrayOffset
-    );
 }
